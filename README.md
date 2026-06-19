@@ -4,6 +4,9 @@ OpenAI-compatible proxy **+ full Qwen Web UI reverse proxy** for chat.qwen.ai. S
 
 Pure Node.js (ESM). Runtime code uses only Node built-ins (`http`, `crypto`, `fs`, `path`, `url`, global `fetch`).
 
+<img width="921" height="796" alt="image" src="https://github.com/user-attachments/assets/eb0995f4-1321-447c-9ab3-b873569829e9" />
+
+
 ## Quick Start
 
 ```bash
