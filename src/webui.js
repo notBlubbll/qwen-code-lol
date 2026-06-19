@@ -1,14 +1,3 @@
-/**
- * Reverse proxy for the Qwen Web UI (chat.qwen.ai).
- *
- * Serves the real SPA HTML/CSS/JS, injects our JWT auth token so the
- * UI thinks it's logged in, mocks user routes with a fake "Qwen Slurp"
- * user, and proxies all API calls with source:desktop + Bearer JWT.
- *
- * An SSE toggle button is injected to switch between streaming and
- * buffered responses.
- */
-
 import { createHash, randomUUID } from 'crypto';
 import { readFileSync, existsSync, writeFileSync } from 'fs';
 import { join, dirname } from 'path';
@@ -33,42 +22,56 @@ function saveConfig(cfg) {
 }
 const _config = loadConfig();
 
-// ─── Fake user (shown in SPA instead of real account) ──────────
-// In ANON mode: returns fake "Qwen Slurp" user
-// In normal mode: returns real user data with role forced to "user"
+// ─── Fake JWT (valid base64url structure, SPA can decode without crashing) ──
 
-function getFakeUser(realUser = null) {
-  const base = realUser || _user;
-  // In ANON mode, always return fake user
-  if (_config.ANON && !base) {
-    return {
-      id: randomUUID(),
-      email: 'slurp@qwen.ai',
-      name: 'Qwen Slurp',
-      role: 'user',
-      profile_image_url: '',
-      tier: '',
-      token: '',
-      token_type: 'Bearer',
-      expires_at: Math.floor((Date.now() + 3600 * 1000) / 1000),
-      permissions: {
-        workspace: { models: false, knowledge: false, prompts: false, tools: false },
-        chat: { file_upload: true, delete: true, edit: true, temporary: true },
-      },
-    };
-  }
-  // In normal mode, return real user data with role forced to "user"
+function generateFakeJwt() {
+  const header = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url');
+  const payload = Buffer.from(JSON.stringify({
+    sub: 'anon-user-id',
+    email: 'anon@qwen.ai',
+    name: 'Anon',
+    role: 'user',
+    iat: Math.floor(Date.now() / 1000),
+    exp: Math.floor(Date.now() / 1000) + 365 * 24 * 3600,
+  })).toString('base64url');
+  const sig = Buffer.from('qwen-slurp-anon-signature-' + Date.now()).toString('base64url').slice(0, 43);
+  return header + '.' + payload + '.' + sig;
+}
+
+let _anonJwt = generateFakeJwt();
+
+// ─── Fake user (for ANON mode and logged-in mode) ──────────────
+
+function getAnonUser() {
   return {
-    id: base?.id || randomUUID(),
-    email: base?.email || 'unknown@qwen.ai',
-    name: base?.name || 'Qwen User',
-    role: 'user', // force "user" to bypass account-pending overlay
-    profile_image_url: base?.profile_image_url || '',
-    tier: base?.tier || '',
-    token: base?.token || _jwt || '',
+    id: 'a0000000-0000-0000-0000-000000000001',
+    email: 'anon@qwen.ai',
+    name: 'Anon',
+    role: 'user',
+    profile_image_url: '',
+    tier: '',
+    token: _anonJwt,
     token_type: 'Bearer',
-    expires_at: base?.expires_at || Math.floor((Date.now() + 3600 * 1000) / 1000),
-    permissions: base?.permissions || {
+    expires_at: Math.floor((Date.now() + 365 * 24 * 3600 * 1000) / 1000),
+    permissions: {
+      workspace: { models: false, knowledge: false, prompts: false, tools: false },
+      chat: { file_upload: true, delete: true, edit: true, temporary: true },
+    },
+  };
+}
+
+function getFakeUser(realUser) {
+  return {
+    id: realUser?.id || randomUUID(),
+    email: realUser?.email || 'unknown@qwen.ai',
+    name: realUser?.name || 'Qwen User',
+    role: 'user',
+    profile_image_url: realUser?.profile_image_url || '',
+    tier: realUser?.tier || '',
+    token: realUser?.token || _jwt || '',
+    token_type: 'Bearer',
+    expires_at: realUser?.expires_at || Math.floor((Date.now() + 3600 * 1000) / 1000),
+    permissions: realUser?.permissions || {
       workspace: { models: false, knowledge: false, prompts: false, tools: false },
       chat: { file_upload: true, delete: true, edit: true, temporary: true },
     },
@@ -81,26 +84,22 @@ let _jwt = null;
 let _cookies = null;
 let _jwtExpiry = 0;
 let _user = null;
+let _loggedOut = false;
+
+function isLoggedIn() {
+  return !_loggedOut && _jwt && Date.now() < _jwtExpiry;
+}
 
 async function getJwt() {
-  // ANON mode: return fake user without upstream login
-  if (_config.ANON) {
-    if (!_jwt) {
-      _jwt = 'anon-demo-mode';
-      _jwtExpiry = Date.now() + 365 * 24 * 3600 * 1000;
-      _user = getFakeUser();
-    }
-    return { jwt: null, cookies: '', user: _user }; // jwt=null so we don't send Bearer to upstream
-  }
-
-  if (_jwt && _jwt !== 'anon-demo-mode' && Date.now() < _jwtExpiry) {
+  if (isLoggedIn()) {
     return { jwt: _jwt, cookies: _cookies, user: _user };
   }
 
-  const { email, password, passwordHash } = _config.qwenLogin || {};
-  if (!email || (!password && !passwordHash)) return null; // guest mode — no creds
+  if (_loggedOut) return null;
 
-  // Hash plaintext if available; otherwise use stored hash directly
+  const { email, password, passwordHash } = _config.qwenLogin || {};
+  if (!email || (!password && !passwordHash)) return null;
+
   const hash = password
     ? createHash('sha256').update(password, 'utf8').digest('hex')
     : passwordHash;
@@ -136,20 +135,19 @@ function clearJwt() {
   console.log('[webui] JWT cleared (logout)');
 }
 
-// Handle SPA signin: proxy to upstream, save creds, return fake user
+// ─── SPA signin handler ──────────────────────────────────────
+
 async function handleSignin(req, res, body) {
   try {
     const { email, password } = JSON.parse(body);
-    // The SPA sends a SHA-256 hashed password. Save creds so getJwt() can
-    // reuse them for JWT refresh. Store as passwordHash.
     if (email && password) {
       const newCfg = { ..._config, qwenLogin: { email, passwordHash: password } };
+      delete newCfg.ANON;
       saveConfig(newCfg);
       Object.assign(_config, newCfg);
       console.log(`[webui] Saved credentials for ${email}`);
     }
 
-    // Login to upstream — password is already hashed, send as-is
     const resp = await fetch(`${UPSTREAM}/api/v1/auths/signin`, {
       method: 'POST',
       headers: {
@@ -174,9 +172,9 @@ async function handleSignin(req, res, body) {
     _cookies = (resp.headers.getSetCookie() || []).map(c => c.split(';')[0]).join('; ');
     _user = realUser;
     _jwtExpiry = Date.now() + 3600 * 1000;
+    _loggedOut = false;
     console.log(`[webui] User signed in: ${email}`);
 
-    // Return fake user in v2 format: { success: true, data: {user} }
     const fakeUser = getFakeUser(realUser);
     res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
     res.end(JSON.stringify({ success: true, data: fakeUser }));
@@ -190,8 +188,7 @@ async function handleSignin(req, res, body) {
 // Handle SPA signout: clear JWT + creds, return success
 function handleSignout(res) {
   clearJwt();
-  // Clear saved credentials AND anon flag so getJwt() returns null (guest mode)
-  const cfgPath = join(__dirname, '../.config/config.json');
+  _loggedOut = true;
   try {
     const cfg = { ..._config };
     delete cfg.qwenLogin;
@@ -199,124 +196,163 @@ function handleSignout(res) {
     saveConfig(cfg);
     Object.assign(_config, cfg);
   } catch {}
-  console.log('[webui] User signed out (creds + anon cleared)');
+  console.log('[webui] User signed out');
   res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
   res.end(JSON.stringify({ success: true, data: { status: true } }));
 }
 
-// Handle demo login: enable ANON mode, reload page
-function handleDemoLogin(res) {
-  const newCfg = { ..._config, ANON: true };
-  delete newCfg.qwenLogin; // clear any real creds
-  saveConfig(newCfg);
-  Object.assign(_config, newCfg);
-  // Set a fake JWT so mock routes activate immediately
-  _jwt = 'anon-demo-mode';
-  _jwtExpiry = Date.now() + 365 * 24 * 3600 * 1000; // 1 year
-  _user = getFakeUser();
-  console.log('[webui] Demo mode enabled (ANON)');
+// Handle anon mode toggle
+function handleAnonToggle(res, enable, redirect) {
+  const cfg = { ..._config };
+  if (enable) {
+    cfg.ANON = true;
+    clearJwt();
+    _anonJwt = generateFakeJwt();
+  } else {
+    delete cfg.ANON;
+    clearJwt();
+    _loggedOut = true;
+  }
+  saveConfig(cfg);
+  Object.assign(_config, cfg);
+  console.log(`[webui] ANON mode ${enable ? 'enabled' : 'disabled'}`);
+
+  if (redirect && !enable) {
+    res.writeHead(200, {
+      'Content-Type': 'text/html; charset=utf-8',
+      'Set-Cookie': 'token=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; SameSite=Lax',
+    });
+    return res.end(`<!DOCTYPE html><html><head><script>
+      localStorage.clear();
+      sessionStorage.clear();
+      document.cookie.split(';').forEach(function(c){document.cookie=c.replace(/^ +/,'').replace(/=.*/,'=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path=/');});
+      window.location.replace('/auth');
+    </script></head><body></body></html>`);
+  }
+
   res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
   res.end(JSON.stringify({ success: true, data: { status: true } }));
 }
 
-// ─── Mock routes (return fake user without upstream call) ──────
+// ─── Mock routes ──────────────────────────────────────────────
 
-function getAuthUserResponse(realUser = null) {
-  return JSON.stringify(getFakeUser(realUser));
+function getV1AuthUserResponse(user) {
+  return JSON.stringify(user || getAnonUser());
 }
 
-function getV2AuthUserResponse(realUser = null) {
-  return JSON.stringify({ success: true, data: getFakeUser(realUser) });
+function getV2AuthUserResponse(user) {
+  return JSON.stringify({ success: true, request_id: randomUUID(), data: user || getAnonUser() });
 }
 
-// Endpoints that crash the SPA when upstream returns {success:false}.
-// Mock them with proper empty data shapes in ANON mode.
-const ANON_EMPTY_ARRAY = JSON.stringify({ success: true, data: [] });
-const ANON_EMPTY_OBJ = JSON.stringify({ success: true, data: {} });
-
-const MOCK_ROUTES = [
-  // v1 auth — returns user object directly (real user with role forced to "user")
-  { match: '/api/v1/auths/', body: () => getAuthUserResponse(_user) },
-  // v2 auth — returns { success, data: {user} }
-  { match: '/api/v2/auths/', body: () => getV2AuthUserResponse(_user), excludeExact: ['/api/v2/auths/signin', '/api/v2/auths/signout'] },
-];
-
-// ANON-mode mocks: return empty data so SPA doesn't crash on destructuring.
-const ANON_MOCK_ROUTES = [
-  { match: '/api/v1/auths/', body: () => getAuthUserResponse() },
-  { match: '/api/v2/auths/', body: () => getV2AuthUserResponse(), excludeExact: ['/api/v2/auths/signin', '/api/v2/auths/signout'] },
-  { match: '/api/v2/chats', body: () => ANON_EMPTY_ARRAY },          // pinned chats, chat list, new chat
-  { match: '/api/v2/folders/', body: () => ANON_EMPTY_ARRAY },
-  { match: '/api/v2/projects/', body: () => ANON_EMPTY_ARRAY },
-  { match: '/api/v2/users/user/settings', body: () => ANON_EMPTY_OBJ },
-  { match: '/api/v2/users/user/entitlement', body: () => ANON_EMPTY_OBJ },
-  { match: '/api/v2/users/user/entitlement_quota', body: () => ANON_EMPTY_OBJ },
-  { match: '/api/v2/notifications/', body: () => ANON_EMPTY_ARRAY },
-  { match: '/api/v1/notifications/', body: () => ANON_EMPTY_ARRAY },
-  { match: '/api/v2/mcp/list', body: () => ANON_EMPTY_ARRAY },
-];
+const ANON_SETTINGS = JSON.stringify({
+  success: true,
+  request_id: '',
+  data: {
+    ui: {
+      notificationEnabled: false, theme: 'dark', language: '', chatBubble: true,
+      showUsername: false, widescreenMode: false, title: {}, autoTags: true,
+      largeTextAsFile: true, splitLargeChunks: false, scrollOnBranchChange: true,
+      responseAutoCopy: false, models: [],
+    },
+    mcp_remind: true, mcp_remind_time: '',
+  },
+});
 
 function findMockRoute(pathname) {
-  if (!_jwt && !_config.ANON) return null;
-
-  // In ANON mode: mock auth routes + private endpoints that would crash
+  // ── ANON mode: mock auth + all private endpoints ──
   if (_config.ANON) {
-    // Check public APIs first — these should be proxied, not mocked
-    const isPublicApi = pathname.startsWith('/api/v2/configs')
-      || pathname.startsWith('/api/v2/tts/')
-      || pathname === '/api/v2/users/status'
-      || pathname.startsWith('/api/models');
-    if (isPublicApi) return null;
-
-    // Check ANON mocks
-    const anonMock = ANON_MOCK_ROUTES.find(r => {
-      if (r.excludeExact && r.excludeExact.includes(pathname)) return false;
-      return pathname === r.match || pathname.startsWith(r.match);
-    });
-    if (anonMock) return anonMock;
-
-    // Catch-all: any other unmatched /api/ route returns empty array
-    if (pathname.startsWith('/api/')) {
-      return { body: () => ANON_EMPTY_ARRAY };
+    // Public APIs: proxy to upstream (no JWT needed)
+    if (pathname.startsWith('/api/v2/configs') ||
+        pathname.startsWith('/api/v2/tts/') ||
+        pathname === '/api/v2/users/status' ||
+        pathname.startsWith('/api/v2/models') ||
+        pathname.startsWith('/api/models')) {
+      return null;
     }
+
+    // Auth routes: return fake Anon user
+    if ((pathname.startsWith('/api/v1/auths/') || pathname.startsWith('/api/v2/auths/')) &&
+        pathname !== '/api/v2/auths/signin' && pathname !== '/api/v2/auths/signout') {
+      if (pathname.startsWith('/api/v2/')) return { body: () => getV2AuthUserResponse() };
+      return { body: () => getV1AuthUserResponse() };
+    }
+
+    // Chat completions + new chat: must proxy to upstream with REAL JWT
+    // (so ANON users can actually chat). getJwt() will use qwenLogin creds.
+    if (pathname.includes('/chat/completions') ||
+        pathname === '/api/v2/chats/new') {
+      return null;
+    }
+    // Specific chat ID (PUT/DELETE) — proxy with real JWT
+    if (/^\/api\/v2\/chats\/[0-9a-f-]{36}$/.test(pathname)) {
+      return null;
+    }
+
+    // Chat list, pinned, search — mock empty
+    if (pathname.startsWith('/api/v2/chats')) {
+      return { body: () => '{"success":true,"request_id":"","data":[]}' };
+    }
+
+    // User endpoints
+    if (pathname === '/api/v2/users/user/settings') {
+      return { body: () => ANON_SETTINGS };
+    }
+    if (pathname.startsWith('/api/v2/users/user/entitlement')) {
+      return { body: () => '{"success":false,"request_id":"","data":{"code":"not found","details":"Not Found"}}' };
+    }
+
+    // Folders, projects, library, mcp, notifications
+    if (pathname.startsWith('/api/v2/folders/') ||
+        pathname.startsWith('/api/v2/projects/') ||
+        pathname.startsWith('/api/v2/library/') ||
+        pathname.startsWith('/api/v2/mcp/') ||
+        pathname.startsWith('/api/v1/notifications/') ||
+        pathname.startsWith('/api/v2/notifications/')) {
+      return { body: () => '{"success":true,"request_id":"","data":[]}' };
+    }
+
+    // Catch-all for any other /api/ route we missed
+    if (pathname.startsWith('/api/')) {
+      return { body: () => '{"success":true,"request_id":"","data":[]}' };
+    }
+
     return null;
   }
 
-  // Normal auth mode: mock auth routes with real user data
-  return MOCK_ROUTES.find(r => {
-    if (r.excludeExact && r.excludeExact.includes(pathname)) return false;
-    return pathname === r.match || pathname.startsWith(r.match);
-  });
+  // ── Logged-in mode: mock auth routes with real user data ──
+  if (!isLoggedIn()) return null;
+  if ((pathname.startsWith('/api/v1/auths/') || pathname.startsWith('/api/v2/auths/')) &&
+      pathname !== '/api/v2/auths/signin' && pathname !== '/api/v2/auths/signout') {
+    if (pathname.startsWith('/api/v2/')) return { body: () => getV2AuthUserResponse(getFakeUser(_user)) };
+    return { body: () => getV1AuthUserResponse(getFakeUser(_user)) };
+  }
+  return null;
 }
 
 // ─── Inject scripts ──────────────────────────────────────────
 
-// HEAD_INJECT_SCRIPT: runs before main.js. Fetch interceptor + data patching.
 const HEAD_INJECT_SCRIPT = `
 <script>
 (function() {
-  // 1. Patch __prerendered_data user role to "user" before SPA reads it.
-  // When the HTML is served with auth cookies, the SSR may include a user object
-  // with role:"pending" for unverified accounts. Force it to "user".
   try {
     if (window.__prerendered_data && window.__prerendered_data.user) {
       window.__prerendered_data.user.role = 'user';
     }
   } catch (e) {}
 
-  // 2. Intercept fetch to add source:desktop header + SSE toggle
   var origFetch = window.fetch;
   window.fetch = function(input, init) {
     init = init || {};
-    init.headers = init.headers || {};
-    if (typeof input === 'string' && input.startsWith('/api/')) {
+    var url = typeof input === 'string' ? input : (input instanceof Request ? input.url : '');
+    if (url.startsWith('/api/')) {
+      init.headers = init.headers || {};
       if (init.headers instanceof Headers) {
-        init.headers.set('source', 'desktop'); // replace, not append
+        init.headers.set('source', 'desktop');
       } else if (typeof init.headers === 'object') {
-        init.headers['source'] = 'desktop'; // replace, not append
+        init.headers['source'] = 'desktop';
       }
     }
-    if (typeof input === 'string' && input.includes('/chat/completions')) {
+    if (url.includes('/chat/completions')) {
       var sseEnabled = window.__qwenSseEnabled !== false;
       if (!sseEnabled && init.body) {
         try {
@@ -331,27 +367,35 @@ const HEAD_INJECT_SCRIPT = `
     return origFetch.call(this, input, init);
   };
 
-  // 3. Intercept XHR (axios) to add source:desktop header (replace, not append)
   var origXhrOpen = XMLHttpRequest.prototype.open;
+  var origXhrSetHeader = XMLHttpRequest.prototype.setRequestHeader;
   var origXhrSend = XMLHttpRequest.prototype.send;
   XMLHttpRequest.prototype.open = function(method, url) {
     this._url = url;
+    this._sourceSet = false;
     return origXhrOpen.apply(this, arguments);
   };
+  XMLHttpRequest.prototype.setRequestHeader = function(name, value) {
+    if (name.toLowerCase() === 'source' && this._url && typeof this._url === 'string' && this._url.includes('/api/')) {
+      this._sourceSet = true;
+      return origXhrSetHeader.call(this, 'source', 'desktop');
+    }
+    return origXhrSetHeader.apply(this, arguments);
+  };
   XMLHttpRequest.prototype.send = function(body) {
-    if (this._url && typeof this._url === 'string' && this._url.includes('/api/')) {
-      this.setRequestHeader('source', 'desktop'); // replace, not append
+    if (!this._sourceSet && this._url && typeof this._url === 'string' && this._url.includes('/api/')) {
+      origXhrSetHeader.call(this, 'source', 'desktop');
     }
     return origXhrSend.apply(this, arguments);
   };
 
-  // 4. Safety net: remove account-pending overlay if it still appears
-  // (the role rewrite should prevent it, but this catches edge cases)
   function startObserver() {
     if (!document.body) return setTimeout(startObserver, 50);
     var observer = new MutationObserver(function() {
       var overlay = document.querySelector('.account-pending-overlay');
       if (overlay) overlay.remove();
+      var cookie = document.querySelector('[class*="cookie-confirm"]');
+      if (cookie) cookie.remove();
     });
     observer.observe(document.body, { childList: true, subtree: true });
   }
@@ -360,16 +404,16 @@ const HEAD_INJECT_SCRIPT = `
 </script>
 `;
 
-// BODY_INJECT_SCRIPT: runs after DOM ready. SSE toggle + Demo login buttons.
 const BODY_INJECT_SCRIPT = `
 <script>
 (function() {
-  // SSE Toggle button
+  window.__qwenSseEnabled = true;
+
   function createToggle() {
     if (document.getElementById('sse-toggle')) return;
     var btn = document.createElement('div');
     btn.id = 'sse-toggle';
-    btn.style.cssText = 'position:fixed;bottom:16px;right:16px;z-index:99999;background:#615ced;color:#fff;padding:8px 14px;border-radius:20px;font-size:12px;font-family:inherit;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.3);user-select:none;display:flex;align-items:center;gap:6px;transition:opacity .2s';
+    btn.style.cssText = 'position:fixed;bottom:16px;right:16px;z-index:99999;background:#615ced;color:#fff;padding:8px 14px;border-radius:20px;font-size:12px;font-family:inherit;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.3);user-select:none;display:flex;align-items:center;gap:6px';
     btn.innerHTML = '<span id="sse-status">SSE: ON</span>';
     btn.onclick = function() {
       window.__qwenSseEnabled = window.__qwenSseEnabled !== false ? false : true;
@@ -379,88 +423,92 @@ const BODY_INJECT_SCRIPT = `
     document.body.appendChild(btn);
   }
 
-  // Demo Login button (visible only when not logged in and not in ANON mode)
-  function createDemoLogin() {
-    if (document.getElementById('demo-login-btn')) return;
+  function createAnonBtn() {
+    if (document.getElementById('anon-toggle-btn')) return;
     var btn = document.createElement('div');
-    btn.id = 'demo-login-btn';
-    btn.style.cssText = 'position:fixed;bottom:16px;right:120px;z-index:99999;background:#10b981;color:#fff;padding:8px 14px;border-radius:20px;font-size:12px;font-family:inherit;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.3);user-select:none;display:flex;align-items:center;gap:6px;transition:opacity .2s';
-    btn.textContent = 'Login as Demo';
-    btn.onclick = function() {
-      btn.textContent = 'Loading...';
-      fetch('/api/demo-login', { method: 'POST' })
-        .then(function() { window.location.reload(); })
-        .catch(function() { btn.textContent = 'Error — retry'; });
-    };
+    btn.id = 'anon-toggle-btn';
+    btn.style.cssText = 'position:fixed;bottom:16px;right:120px;z-index:99999;background:#10b981;color:#fff;padding:8px 14px;border-radius:20px;font-size:12px;font-family:inherit;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.3);user-select:none;display:flex;align-items:center;gap:6px';
+    if (window.__qwen_anon_mode) {
+      btn.textContent = 'Exit Anon';
+      btn.style.background = '#ef4444';
+      btn.onclick = function() {
+        window.location.href = '/api/anon-toggle?enable=false&redirect=1';
+      };
+    } else {
+      btn.textContent = 'Anon Mode';
+      btn.onclick = function() {
+        btn.textContent = 'Loading...';
+        fetch('/api/anon-toggle?enable=true', { method: 'POST' })
+          .then(function() { window.location.reload(); });
+      };
+    }
     document.body.appendChild(btn);
   }
 
-  // Show/hide demo button based on auth state
-  function updateDemoButton() {
-    var btn = document.getElementById('demo-login-btn');
-    if (!btn) return;
-    // Hide in ANON mode, or if logged in (token cookie or SPA rendered chat UI)
-    if (window.__qwen_anon_mode) {
-      btn.style.display = 'none';
-      return;
-    }
-    var hasToken = document.cookie.includes('token=');
-    var hasChat = !!document.querySelector('.desktop-layout, .sidebar, .chat-input');
-    if (hasToken || hasChat) {
-      btn.style.display = 'none';
-    } else {
-      btn.style.display = 'flex';
-    }
+  function createAnonLabel() {
+    if (!window.__qwen_anon_mode) return;
+    if (document.getElementById('anon-label')) return;
+    var label = document.createElement('div');
+    label.id = 'anon-label';
+    label.textContent = 'ANON';
+    label.style.cssText = 'position:fixed;top:12px;left:12px;z-index:99999;background:#f59e0b;color:#000;padding:4px 10px;border-radius:12px;font-size:11px;font-weight:bold;font-family:inherit;pointer-events:none';
+    document.body.appendChild(label);
   }
 
-  window.__qwenSseEnabled = true;
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', function() {
-      createToggle();
-      createDemoLogin();
-      updateDemoButton();
-      setTimeout(updateDemoButton, 2000); // re-check after SPA loads
-    });
-  } else {
+  function init() {
     createToggle();
-    createDemoLogin();
-    updateDemoButton();
-    setTimeout(updateDemoButton, 2000);
+    createAnonBtn();
+    createAnonLabel();
+    setTimeout(createAnonLabel, 2000);
+    setTimeout(createAnonLabel, 5000);
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init);
+  } else {
+    init();
   }
 })();
 </script>
 `;
 
-// ─── Patch HTML: replace prerendered user data ──────────────
+// ─── Patch HTML ───────────────────────────────────────────────
 
 function patchHtml(html, jwt) {
   let patched = html;
 
-  // Version marker for cache-busting verification
-  patched = patched.replace('<head>', '<head><!-- QWEN-SLURP-V3 -->');
+  patched = patched.replace('<head>', '<head><!-- QWEN-SLURP-V5 -->');
 
-  // Inject ANON mode flag so the demo button can hide itself
   if (_config.ANON) {
-    patched = patched.replace('<head>', '<head><script>window.__qwen_anon_mode=true;</script>');
+    patched = patched.replace('<head>', '<head><script>Object.defineProperty(window,"__qwen_anon_mode",{value:true,writable:false,configurable:false});</script>');
   }
 
-  // 1. Strip ALL SSR content from #root so React uses createRoot (not hydrateRoot).
-  // The SSR renders the entire app (sidebar, chat, etc.) inside #root.
-  // We replace everything from <div id="root"> to the next <script or </body>
-  // with an empty root div, avoiding hydration mismatches and raw HTML leaks.
   patched = patched.replace(
     /<div id="root">[\s\S]*?(?=<script|<\/body>)/,
     '<div id="root"></div>\n  '
   );
 
-  // 2. Inject critical script BEFORE main.js
+  patched = patched.replace(
+    /(<script(?![^>]*\bsrc=)(?![^>]*\btype=module)(?![^>]*\bid=["']__prerendered_data)[^>]*>)([\s\S]*?)(<\/script>)/g,
+    function(match, openTag, code, closeTag) {
+      if (code.trim().length === 0) return match;
+      return openTag + 'try{' + code + '}catch(e){}' + closeTag;
+    }
+  );
+
   patched = patched.replace(
     /(<script[^>]*type=module[^>]*src=[^>]*main\.js[^>]*>)/,
     `${HEAD_INJECT_SCRIPT}$1`
   );
 
-  // 3. Inject rest before </body>
-  patched = patched.replace('</body>', `${BODY_INJECT_SCRIPT}</body>`);
+  const afterBodyMatch = patched.match(/<\/body>([\s\S]*?)<\/html>/);
+  const afterBodyScripts = afterBodyMatch ? afterBodyMatch[1].trim() : '';
+  if (afterBodyScripts) {
+    patched = patched.replace(/<\/body>[\s\S]*<\/html>/, '');
+    patched += `${BODY_INJECT_SCRIPT}\n${afterBodyScripts}\n</body>\n</html>`;
+  } else {
+    patched = patched.replace('</body>', `${BODY_INJECT_SCRIPT}</body>`);
+  }
 
   return patched;
 }
@@ -490,7 +538,6 @@ async function proxyToUpstream(req, res, pathname, search, body, jwt, cookies) {
       body: body || undefined,
     });
 
-    // Handle SSE streaming — pipe through
     if (isSse && (resp.headers.get('content-type')?.includes('event-stream') || resp.headers.get('content-type')?.includes('octet-stream'))) {
       res.writeHead(resp.status, {
         'Content-Type': 'text/event-stream; charset=utf-8',
@@ -515,13 +562,11 @@ async function proxyToUpstream(req, res, pathname, search, body, jwt, cookies) {
       return;
     }
 
-    // Regular response
     const respBody = await resp.text();
-    const respHeaders = {
+    res.writeHead(resp.status, {
       'Content-Type': resp.headers.get('content-type') || 'application/json',
       'Access-Control-Allow-Origin': '*',
-    };
-    res.writeHead(resp.status, respHeaders);
+    });
     res.end(respBody);
   } catch (err) {
     console.error(`[webui] Proxy error for ${pathname}:`, err.message);
@@ -553,7 +598,6 @@ async function serveHtml(req, res, pathname, search, jwt, cookies) {
       'Expires': '0',
       'Access-Control-Allow-Origin': '*',
     };
-    // Set the token cookie so the SPA thinks it's authenticated
     if (jwt) {
       const cookieExpiry = new Date(Date.now() + 3600 * 1000).toUTCString();
       respHeaders['Set-Cookie'] = `token=${jwt}; Path=/; Expires=${cookieExpiry}; SameSite=Lax`;
@@ -572,7 +616,6 @@ export async function handleWebUI(req, res, url) {
   const pathname = url.pathname;
   const search = url.search || '';
 
-  // CORS preflight
   if (req.method === 'OPTIONS') {
     res.writeHead(204, {
       'Access-Control-Allow-Origin': '*',
@@ -582,7 +625,6 @@ export async function handleWebUI(req, res, url) {
     return res.end();
   }
 
-  // Read request body
   const body = req.method !== 'GET' && req.method !== 'HEAD'
     ? await new Promise((resolve, reject) => {
         const chunks = [];
@@ -592,30 +634,35 @@ export async function handleWebUI(req, res, url) {
       })
     : null;
 
-  // ── Auth actions ─────────────────────────────────────────────
-  // Sign in: proxy to upstream, save creds, return fake user
   if (pathname === '/api/v2/auths/signin' && req.method === 'POST') {
     return handleSignin(req, res, body);
   }
-  // Sign out: clear JWT + creds, return success
   if (pathname === '/api/v2/auths/signout') {
     return handleSignout(res);
   }
-  // Demo login: enable ANON mode (no real creds needed)
-  if (pathname === '/api/demo-login') {
-    return handleDemoLogin(res);
+  if (pathname === '/api/anon-toggle') {
+    const enable = url.searchParams.get('enable') !== 'false';
+    const redirect = url.searchParams.get('redirect') === '1';
+    return handleAnonToggle(res, enable, redirect);
   }
 
-  // Get JWT (null in guest mode — no creds configured)
+  // Resolve JWT for upstream proxying
   let jwt = null, cookies = null, user = null;
-  try {
-    ({ jwt, cookies, user } = await getJwt() || {});
-  } catch (err) {
-    console.error('[webui] Auth error:', err.message);
-    // Continue in guest mode — SPA will show login screen
+  if (_config.ANON) {
+    jwt = _anonJwt;
+    try {
+      const realAuth = await getJwt();
+      if (realAuth) {}
+    } catch {}
+  } else {
+    try {
+      ({ jwt, cookies, user } = await getJwt() || {});
+    } catch (err) {
+      console.error('[webui] Auth error:', err.message);
+    }
   }
 
-  // ── Mock auth routes (return fake "Qwen Slurp" user) ────────
+  // Mock routes
   const mock = findMockRoute(pathname);
   if (mock) {
     res.writeHead(200, {
@@ -625,23 +672,39 @@ export async function handleWebUI(req, res, url) {
     return res.end(mock.body());
   }
 
-  // HTML pages — serve with auth injection + cookie
+  // HTML pages
   if (req.method === 'GET' && (pathname === '/' || pathname.startsWith('/c/') || pathname === '/auth' || pathname.startsWith('/authorize'))) {
     return serveHtml(req, res, pathname, search, jwt, cookies);
   }
 
-  // API routes — proxy to upstream with auth (if we have JWT)
+  // API routes
   if (pathname.startsWith('/api/')) {
-    // In ANON mode: proxy all API calls without JWT.
-    // Public endpoints (configs, tts, models) work fine; private ones
-    // return {success:false} from upstream which the SPA handles gracefully.
     if (_config.ANON) {
+      // For ANON mode: chat completions and chat CRUD need REAL JWT
+      const needsRealJwt = pathname.includes('/chat/completions') ||
+        pathname === '/api/v2/chats/new' ||
+        pathname.match(/^\/api\/v2\/chats\/[^/]+$/);
+
+      if (needsRealJwt) {
+        try {
+          const realAuth = await getJwt();
+          if (realAuth) {
+            return proxyToUpstream(req, res, pathname, search, body, realAuth.jwt, realAuth.cookies);
+          }
+        } catch {}
+        // No real creds — fall through to 401
+        res.writeHead(401, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+        return res.end(JSON.stringify({ success: false, data: { code: 'Forbidden', details: 'ANON mode requires qwenLogin credentials for chat' } }));
+      }
+
+      // Other API calls: proxy without auth (guest)
       return proxyToUpstream(req, res, pathname, search, body, null, '');
     }
-    // Config/TTS/users-status/models endpoints are public (work without auth).
+
     const isPublicApi = pathname.startsWith('/api/v2/configs')
       || pathname.startsWith('/api/v2/tts/')
       || pathname === '/api/v2/users/status'
+      || pathname.startsWith('/api/v2/models')
       || pathname.startsWith('/api/models');
     if (!jwt && !isPublicApi) {
       res.writeHead(401, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
@@ -650,7 +713,6 @@ export async function handleWebUI(req, res, url) {
     return proxyToUpstream(req, res, pathname, search, body, jwt, cookies);
   }
 
-  // Static files — proxy
   if (req.method === 'GET') {
     return proxyToUpstream(req, res, pathname, search, null, jwt, cookies);
   }
