@@ -370,6 +370,12 @@ const HEAD_INJECT_SCRIPT = `
         init.headers['source'] = 'desktop';
       }
     }
+    // Rewrite CDN image fetches to go through /img proxy (avoids orb blocking)
+    if (url.indexOf('cdn.qwenlm.ai') !== -1 || url.indexOf('img.alicdn.com') !== -1 || url.indexOf('assets.alicdn.com') !== -1 || (url.indexOf('/output/') !== -1 && url.indexOf('/img?') === -1)) {
+      var newUrl = '/img?url=' + encodeURIComponent(url);
+      input = newUrl;
+      url = newUrl;
+    }
     if (url.includes('/chat/completions')) {
       var sseEnabled = window.__qwenSseEnabled !== false;
       if (!sseEnabled && init.body) {
@@ -410,15 +416,86 @@ const HEAD_INJECT_SCRIPT = `
   // Rewrite CDN image URLs to go through our /img proxy (avoids orb blocking)
   function proxyImg(src) {
     if (!src || typeof src !== 'string') return src;
-    if (src.indexOf('cdn.qwenlm.ai') === -1 && src.indexOf('/output/') === -1) return src;
+    if (src.indexOf('/img?url=') !== -1) return src; // already proxied
+    if (src.indexOf('cdn.qwenlm.ai') === -1 &&
+        src.indexOf('/output/') === -1 &&
+        src.indexOf('img.alicdn.com') === -1 &&
+        src.indexOf('assets.alicdn.com') === -1) return src;
     if (src.charAt(0) === '/') return '/img?url=' + encodeURIComponent(window.location.origin + src);
     return '/img?url=' + encodeURIComponent(src);
   }
+  // Rewrite a CSS url(...) value, proxying any CDN image URLs inside it
+  function proxyCssUrl(value) {
+    if (!value || typeof value !== 'string') return value;
+    if (value.indexOf('/img?url=') !== -1) return value; // already proxied
+    if (value.indexOf('cdn.qwenlm.ai') === -1 &&
+        value.indexOf('/output/') === -1 &&
+        value.indexOf('img.alicdn.com') === -1 &&
+        value.indexOf('assets.alicdn.com') === -1) return value;
+    // Match url(...) including quotes: url("..."), url('...'), or url(...)
+    return value.replace(/url\(\s*["']?([^"')]+)["']?\s*\)/g, function(match, url) {
+      if (!isCdnUrl(url)) return match;
+      return 'url("' + proxyImg(url) + '")';
+    });
+  }
+  function isCdnUrl(s) {
+    if (!s || typeof s !== 'string') return false;
+    if (s.indexOf('/img?url=') !== -1) return false; // already proxied
+    return s.indexOf('cdn.qwenlm.ai') !== -1 ||
+           s.indexOf('/output/') !== -1 ||
+           s.indexOf('img.alicdn.com') !== -1 ||
+           s.indexOf('assets.alicdn.com') !== -1;
+  }
+  // Intercept setAttribute — React sets style as a whole string via setAttribute('style', ...)
+  var origSetAttribute = Element.prototype.setAttribute;
+  Element.prototype.setAttribute = function(name, value) {
+    if (typeof value === 'string' && name === 'src' && isCdnUrl(value)) {
+      value = proxyImg(value);
+    }
+    return origSetAttribute.call(this, name, value);
+  };
+  // Intercept style.setProperty so React's style updates get proxied
+  var origSetProperty = CSSStyleDeclaration.prototype.setProperty;
+  CSSStyleDeclaration.prototype.setProperty = function(name, value, pri) {
+    if (typeof value === 'string' && (name === 'background-image' || name === 'background' || name === 'border-image' || name === 'list-style-image')) {
+      value = proxyCssUrl(value);
+    }
+    return origSetProperty.call(this, name, value, pri);
+  };
+  // Note: el.style.backgroundImage = "url(...)" cannot be intercepted in Chromium
+  // (it's an own property, not on prototype). We use a requestAnimationFrame poll
+  // in the MutationObserver to catch and rewrite these after React sets them.
+  function rewriteBg(el) {
+    if (!el || !el.style) return;
+    if (el.__qwenBgDone) return;
+    var bg = el.style.backgroundImage;
+    if (!bg || bg === 'none') return;
+    if (!isCdnUrl(bg)) return;
+    // Rewrite via setAttribute('style', ...) which replaces the entire style string
+    var cssText = el.getAttribute('style') || '';
+    if (isCdnUrl(cssText)) {
+      origSetAttribute.call(el, 'style', proxyCssUrl(cssText));
+      el.__qwenBgDone = true;
+    }
+  }
   function rewriteImg(el) {
     if (!el || el.tagName !== 'IMG') return;
+    if (el.__qwenImgDone) return;
     var s = el.getAttribute('src');
-    if (s && (s.indexOf('cdn.qwenlm.ai') !== -1 || (s.indexOf('/output/') !== -1 && s.indexOf('/img?') === -1))) {
-      el.setAttribute('src', proxyImg(s));
+    if (s && isCdnUrl(s)) {
+      origSetAttribute.call(el, 'src', proxyImg(s));
+      el.__qwenImgDone = true;
+    }
+  }
+  function rewriteEl(el) {
+    if (!el || el.nodeType !== 1) return;
+    if (el.tagName === 'IMG') rewriteImg(el);
+    else rewriteBg(el);
+    if (el.querySelectorAll) {
+      var imgs = el.querySelectorAll('img');
+      for (var i = 0; i < imgs.length; i++) rewriteImg(imgs[i]);
+      var divs = el.querySelectorAll('[style*="background-image"], [style*="cdn.qwenlm.ai"], [style*="alicdn.com"], [style*="output"]');
+      for (var j = 0; j < divs.length; j++) rewriteBg(divs[j]);
     }
   }
 
@@ -435,17 +512,30 @@ const HEAD_INJECT_SCRIPT = `
           for (var j = 0; j < m.addedNodes.length; j++) {
             var n = m.addedNodes[j];
             if (n.nodeType === 1) {
-              if (n.tagName === 'IMG') rewriteImg(n);
-              if (n.querySelectorAll) {
-                var imgs = n.querySelectorAll('img');
-                for (var k = 0; k < imgs.length; k++) rewriteImg(imgs[k]);
-              }
+              rewriteEl(n);
             }
           }
+        } else if (m.type === 'attributes') {
+          rewriteEl(m.target);
         }
       }
     });
-    observer.observe(document.body, { childList: true, subtree: true });
+    observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['style', 'src'] });
+    // Poll for background-image changes (React sets el.style.backgroundImage which
+    // doesn't trigger attribute mutations in Chromium)
+    var pollCount = 0;
+    function poll() {
+      var els = document.querySelectorAll('[style*="cdn.qwenlm.ai"], [style*="/output/"], [style*="alicdn.com"]');
+      for (var i = 0; i < els.length; i++) {
+        rewriteBg(els[i]);
+      }
+      var imgs = document.querySelectorAll('img[src*="cdn.qwenlm.ai"], img[src*="alicdn.com"]');
+      for (var j = 0; j < imgs.length; j++) {
+        rewriteImg(imgs[j]);
+      }
+      if (pollCount++ < 200) requestAnimationFrame(poll);
+    }
+    requestAnimationFrame(poll);
   }
   startObserver();
 })();
@@ -659,7 +749,14 @@ async function proxyToUpstream(req, res, pathname, search, body, jwt, cookies) {
       return;
     }
 
-    const respBody = await resp.text();
+    let respBody = await resp.text();
+    // Rewrite CDN image URLs in JSON API responses so the SPA never sees them.
+    // This prevents ERR_BLOCKED_BY_ORB on background-image / img src.
+    if (respBody && respBody.includes('cdn.qwenlm.ai')) {
+      respBody = respBody.replace(/https?:\/\/cdn\.qwenlm\.ai\/output\/[^"'\s,)}\]]+/g, (url) => {
+        return `http://127.0.0.1:${_config.port || 3008}/img?url=${encodeURIComponent(url)}`;
+      });
+    }
     res.writeHead(resp.status, {
       'Content-Type': resp.headers.get('content-type') || 'application/json',
       'Access-Control-Allow-Origin': '*',
@@ -673,6 +770,16 @@ async function proxyToUpstream(req, res, pathname, search, body, jwt, cookies) {
 }
 
 // ─── Serve the SPA HTML ──────────────────────────────────────
+
+// SPA routes (non-API, non-static) that should serve the patched HTML.
+// Any single-segment path without a file extension is a SPA route.
+function isSpaRoute(pathname) {
+  if (pathname.startsWith('/api/')) return false;
+  if (pathname.includes('.')) return false; // static files (.js, .css, .png, etc.)
+  // Multi-segment routes like /c/:id are already handled above;
+  // catch all other single+ paths like /library, /discover, etc.
+  return true;
+}
 
 async function serveHtml(req, res, pathname, search, jwt, cookies) {
   try {
@@ -770,7 +877,7 @@ export async function handleWebUI(req, res, url) {
   }
 
   // HTML pages
-  if (req.method === 'GET' && (pathname === '/' || pathname.startsWith('/c/') || pathname === '/auth' || pathname.startsWith('/authorize'))) {
+  if (req.method === 'GET' && (pathname === '/' || pathname.startsWith('/c/') || pathname === '/auth' || pathname.startsWith('/authorize') || isSpaRoute(pathname))) {
     return serveHtml(req, res, pathname, search, jwt, cookies);
   }
 
