@@ -16,6 +16,16 @@ function loadConfig() {
   }
   return {};
 }
+function applyConfig(cfg) {
+  const keys = Object.keys(_config);
+  for (const k of keys) {
+    if (!(k in cfg)) delete _config[k];
+    else _config[k] = cfg[k];
+  }
+  for (const k of Object.keys(cfg)) {
+    if (!(k in _config)) _config[k] = cfg[k];
+  }
+}
 function saveConfig(cfg) {
   const cfgPath = join(__dirname, '../.config/config.json');
   writeFileSync(cfgPath, JSON.stringify(cfg, null, 2));
@@ -144,7 +154,7 @@ async function handleSignin(req, res, body) {
       const newCfg = { ..._config, qwenLogin: { email, passwordHash: password } };
       delete newCfg.ANON;
       saveConfig(newCfg);
-      Object.assign(_config, newCfg);
+      applyConfig(newCfg);
       console.log(`[webui] Saved credentials for ${email}`);
     }
 
@@ -194,7 +204,7 @@ function handleSignout(res) {
     delete cfg.qwenLogin;
     delete cfg.ANON;
     saveConfig(cfg);
-    Object.assign(_config, cfg);
+    applyConfig(cfg);
   } catch {}
   console.log('[webui] User signed out');
   res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
@@ -214,7 +224,7 @@ function handleAnonToggle(res, enable, redirect) {
     _loggedOut = true;
   }
   saveConfig(cfg);
-  Object.assign(_config, cfg);
+  applyConfig(cfg);
   console.log(`[webui] ANON mode ${enable ? 'enabled' : 'disabled'}`);
 
   if (redirect && !enable) {
