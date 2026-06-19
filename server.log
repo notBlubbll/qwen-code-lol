@@ -1,0 +1,14 @@
+=== Qwen Slurp Proxy Server ===
+Mode: guest (UI only — login required)
+
+Server listening on http://127.0.0.1:3008
+
+Endpoints:
+  GET  /v1/models              — OpenAI: list models
+  POST /v1/chat/completions     — OpenAI: chat (stream supported)
+  GET  /health                  — server status
+  GET  /                        — Qwen Web UI (real SPA)
+  GET  /c/:chatId               — Qwen Web UI (specific chat)
+
+Usage:
+  Open http://127.0.0.1:3008/ in your browser

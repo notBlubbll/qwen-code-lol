@@ -1,0 +1,12 @@
+{
+  "name": "qwen-slurp",
+  "version": "1.0.0",
+  "description": "OpenAI-compatible proxy for Qwen models via Qwen Web API",
+  "main": "src/server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js"
+  },
+  "dependencies": {}
+}
