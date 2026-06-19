@@ -104,7 +104,7 @@ The `/api/v2/chat/completions` endpoint is protected by Alibaba Baxia anti-bot. 
    - Patch `__prerendered_data.user.role` to `"user"`
    - Intercept `fetch()` — replace `source` header with `desktop`, SSE toggle logic
    - Intercept `XMLHttpRequest` — override `setRequestHeader` to replace `source` header, fallback set in `send()`
-   - MutationObserver removes `.account-pending-overlay` and `[class*="cookie-confirm"]`
+   - MutationObserver removes `.account-pending-overlay` and `[class*="cookie-confirm"]`, rewrites `<img>` CDN URLs to `/img` proxy (avoids `blocked_by_orb`)
 6. Move after-`</body>` scripts inside `<body>`
 7. Inject BODY_INJECT_SCRIPT — SSE toggle button, ANON mode button, ANON label
 
@@ -122,12 +122,21 @@ The `/api/v2/chat/completions` endpoint is protected by Alibaba Baxia anti-bot. 
 Qwen's SSE returns `data: {json}\n\n` lines. Each event has:
 - `choices[0].delta.content` — text content
 - `choices[0].delta.reasoning_content` — thinking content (via `extra.summary_thought` when `phase === "thinking_summary"`)
-- `choices[0].delta.phase` — "answer", "thinking_summary", "web_search"
-- `choices[0].delta.function_call` — built-in tool calls (name + arguments)
+- `choices[0].delta.phase` — "answer", "thinking_summary", "web_search", "image_gen_tool"
+- `choices[0].delta.function_call` — built-in tool calls (name + cumulative arguments)
+- `choices[0].delta.role === "function"` — tool-result deltas (carry image URLs in `extra.tool_result[].image` and `extra.image_list[].image`)
 - `choices[0].finish_reason` — null until "finished"
 - `usage` — token counts (`input_tokens`, `output_tokens`, `total_tokens`)
 
-`mapUpstreamDeltaToOpenAI` translates to OpenAI format. Deltas with `role: "function"` (tool results) are skipped. Non-streaming merges tool-call argument chunks by id.
+`DeltaMapper` translates to OpenAI format: `delta.content`→`content`, reasoning→`reasoning_content` (cumulative, diffed), `delta.function_call`→`tool_calls` (cumulative args diffed per tool id). Tool-result deltas (`role: "function"`) have their image URLs extracted and emitted as `![image](url)` markdown content — search result text is skipped, but image URLs are forwarded. Non-streaming merges tool-call argument chunks by id.
+
+### Logging
+Console output (also written to `.logs/server.log`):
+- Startup banner: mode + login email (if authenticated)
+- `[req] POST /v1/chat/completions` — model, message count, stream flag (API path)
+- `[req] prompt: <text>` — last user message text (API path)
+- `[webui] prompt: <text>` — last user message text (Web UI path)
+- `[chat] tool_call: <name>` / `[webui] tool_call: <name>` — tool name, logged once per tool when first detected
 
 ### SSE Toggle
 The injected toggle button sets `window.__qwenSseEnabled`. When disabled, the fetch interceptor converts `stream: true` to `stream: false` in chat completion requests, so the SPA gets a buffered response instead of SSE.
@@ -143,21 +152,24 @@ The injected toggle button sets `window.__qwenSseEnabled`. When disabled, the fe
 | GET | `/v1/models` | OpenAI: list models |
 | POST | `/v1/chat/completions` | OpenAI: chat (stream supported) |
 | GET | `/health` | Server status |
+| GET | `/img?url=<cdn-url>` | Image proxy — fetches Qwen CDN images with desktop headers (avoids `blocked_by_orb`) |
 | POST/GET | `/api/anon-toggle?enable=true\|false&redirect=1` | Toggle ANON mode |
 | POST | `/api/v2/auths/signin` | Proxy login + save creds |
 | GET | `/api/v2/auths/signout` | Clear JWT + creds + set `_loggedOut` |
 
 ## Supported Tools
 
-The Qwen Web API uses **built-in tools only** — user-supplied tool/function definitions in requests are ignored. Tool calls are automatically invoked by Qwen and translated to OpenAI's `tool_calls` format in the response.
+The Qwen Web API uses **built-in tools only** — user-supplied tool/function definitions in requests are ignored. Tool calls are automatically invoked by Qwen and translated to OpenAI's `tool_calls` format in the response. Tool execution is server-side at chat.qwen.ai (our proxy does not execute tools).
 
-| Tool | Description |
-|------|-------------|
-| `web_search` | Web search (auto-invoked for factual/recent queries) |
-| `image-generation` | Generate images from text prompts |
-| `code-interpreter` | Execute Python code in a sandbox |
-| `amap` | Maps and location search (Amap/高德) |
-| `fire-crawl` | Web page crawling and extraction |
+| Tool | API name | Description |
+|------|----------|-------------|
+| Web search | `web_search` | Web search (auto-invoked for factual/recent queries) |
+| Image generation | `image_gen` | Generate images from text prompts — result URLs proxied via `/img` and emitted as `![image](url)` markdown in content |
+| Code interpreter | `code-interpreter` | Execute Python code in a sandbox |
+| Maps | `amap` | Maps and location search (Amap/高德) |
+| Fire crawl | `fire-crawl` | Web page crawling and extraction |
+
+Each tool name is logged once per request when first detected (`[chat] tool_call: <name>` or `[webui] tool_call: <name>`).
 
 ## Models
 
@@ -212,6 +224,7 @@ Browser/Client → HTTP (:3008) → Node.js Proxy
                   ├── /v1/models            → listModels() (src/models.js)
                   ├── /v1/chat/completions  → handleChatCompletion (src/chat.js)
                   ├── /health               → { status: "ok" }
+                  ├── /img?url=<cdn-url>    → image proxy (desktop UA + referer)
                   └── everything else       → handleWebUI (src/webui.js)
                        ├── /api/v2/auths/signin   → Proxy + save creds + fake user
                        ├── /api/v2/auths/signout  → Clear JWT + creds + set _loggedOut

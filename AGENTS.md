@@ -7,8 +7,8 @@ Pure Node.js (ESM). The only third-party dependency in `package.json` (`playwrig
 
 ## Key Files
 - `src/server.js` — HTTP server (port 3008). Routes `/v1/models`, `/v1/chat/completions`, `/health` locally; everything else → `handleWebUI`. Also sets up `.logs/server.log` file logging by overriding `console.log`/`console.error`.
-- `src/webui.js` — Reverse proxy for chat.qwen.ai SPA. Handles three modes (logged-in, ANON, guest). Injects HTML patches (auth, fetch/XHR interceptors, SSE toggle, ANON button, cookie/banner removal). Mocks auth routes and private APIs in ANON mode. Proxies all API calls with `source: desktop` (replaces, not appends).
-- `src/chat.js` — OpenAI → Qwen chat completions. Login (SHA-256), create chat session, send message with `fid` format, parse SSE → OpenAI format. Tool calls (`function_call` → `tool_calls`) translated. Flattens message history into a single `[Role]: ...` text block.
+- `src/webui.js` — Reverse proxy for chat.qwen.ai SPA. Handles three modes (logged-in, ANON, guest). Injects HTML patches (auth, fetch/XHR interceptors, SSE toggle, ANON button, cookie/banner removal). Mocks auth routes and private APIs in ANON mode. Proxies all API calls with `source: desktop` (replaces, not appends). Logs Web UI prompts (`extractWebPrompt`) and tool calls from the SSE stream.
+- `src/chat.js` — OpenAI → Qwen chat completions. Login (SHA-256), create chat session, send message with `fid` format, parse SSE → OpenAI format. Tool calls (`function_call` → `tool_calls`) translated. Tool-result image URLs extracted via `extractImageUrlsFromDelta` and emitted as `![image](url)` markdown content. Flattens message history into a single `[Role]: ...` text block. Logs prompt (`server.js`) and tool calls (`[chat] tool_call: <name>`).
 - `src/models.js` — Model catalog (fetched from `/api/models`, static fallback with **20 models**, 5-min cache).
 - `start.cmd` — Windows launcher: kills stale process on port 3008, cleans `nul` file, opens browser, starts server.
 - `.config/config.json` — Runtime config (see Config section).
@@ -21,7 +21,8 @@ Pure Node.js (ESM). The only third-party dependency in `package.json` (`playwrig
 2. `GET /v1/models` → `listModels()`
 3. `POST /v1/chat/completions` → `handleChatCompletion(body)` (stream or collect)
 4. `GET /health` → `{ status: "ok" }`
-5. **Everything else** → `handleWebUI(req, res, url)`
+5. `GET /img?url=<cdn-url>` → image proxy (fetches CDN images with desktop UA + referer; avoids `blocked_by_orb`)
+6. **Everything else** → `handleWebUI(req, res, url)`
 
 Note: `server.js`'s `loadConfig()` only reads `port`, `defaultModel`, `qwenLogin`. The `ANON` flag and other keys are read by `webui.js`/`chat.js`, which each load the config file independently from `.config/config.json`.
 
@@ -89,7 +90,7 @@ The chat completions endpoint (`/api/v2/chat/completions`) is protected by Aliba
    - Patch `__prerendered_data.user.role` to `"user"`
    - Intercept `fetch()` — replace `source` header with `desktop`, SSE toggle logic
    - Intercept `XMLHttpRequest` — override `setRequestHeader` to replace `source` header, fallback set in `send()`
-   - MutationObserver removes `.account-pending-overlay` and `[class*="cookie-confirm"]`
+   - MutationObserver removes `.account-pending-overlay` and `[class*="cookie-confirm"]`, rewrites `<img>` CDN URLs to `/img` proxy (avoids `blocked_by_orb`)
 6. Move after-`</body>` scripts inside `<body>`
 7. Inject BODY_INJECT_SCRIPT — SSE toggle button, ANON mode button, ANON label
 
@@ -102,6 +103,7 @@ The chat completions endpoint (`/api/v2/chat/completions`) is protected by Aliba
    - Single message: `{ fid, parentId: null, childrenIds: [], role: "user", content, user_action: "send", models: [model], chat_type: "t2t", feature_config, extra, sub_chat_type: "t2t" }`
    - `feature_config.thinking_enabled: true` is **hardcoded** — always on regardless of model capability or config. Other feature flags: `output_schema: "phase"`, `research_mode: "normal"`, `auto_thinking: true`, `thinking_mode: "Auto"`, `thinking_format: "summary"`, `auto_search: false`.
 5. Parse SSE stream → OpenAI chunk format (`streamChat` async generator) or collect into one response (`collectChat`)
+6. Image URLs from tool results rewritten via `proxyImageUrl()` to go through `/img` proxy (avoids CDN `blocked_by_orb`)
 
 Model resolution chain: `resolveModel(requestedModel) || resolveModel(_config.defaultModel) || 'qwen3.7-plus'`. Note the hard fallback is `qwen3.7-plus` even though `defaultModel` is `qwen3-coder-plus` in the shipped config.
 
@@ -109,14 +111,17 @@ Model resolution chain: `resolveModel(requestedModel) || resolveModel(_config.de
 Qwen's SSE returns `data: {json}\n\n` lines. Each event has:
 - `choices[0].delta.content` — text content
 - `choices[0].delta.reasoning_content` — thinking content (via `extra.summary_thought` when `phase === "thinking_summary"`)
-- `choices[0].delta.phase` — "answer", "thinking_summary", "web_search"
-- `choices[0].delta.function_call` — built-in tool calls (name + arguments)
+- `choices[0].delta.phase` — "answer", "thinking_summary", "web_search", "image_gen_tool"
+- `choices[0].delta.function_call` — built-in tool calls (name + cumulative arguments)
+- `choices[0].delta.role === "function"` — tool-result deltas (carry image URLs in `extra.tool_result[].image` and `extra.image_list[].image`)
 - `choices[0].finish_reason` — null until "finished"
 - `usage` — token counts (`input_tokens`, `output_tokens`, `total_tokens`)
 
-`mapUpstreamDeltaToOpenAI` translates: `delta.content`→`content`, reasoning→`reasoning_content`, `delta.function_call`→`tool_calls` (with generated `call_` id if no `function_id`). Deltas with `role: "function"` (tool results) are skipped in streaming. Non-streaming merges tool-call argument chunks by id. `usage` mapped to `prompt_tokens`/`completion_tokens`/`total_tokens`.
+`DeltaMapper` (class in `chat.js`) translates: `delta.content`→`content`, reasoning→`reasoning_content` (cumulative, diffed), `delta.function_call`→`tool_calls` (cumulative args diffed per tool id, generated `call_` id if no `function_id`). Tool-result deltas (`role: "function"`) are extracted for image URLs via `extractImageUrlsFromDelta` and emitted as `![image](url)` markdown content — they are NOT skipped (search result text is skipped, but image URLs are forwarded). `usage` mapped to `prompt_tokens`/`completion_tokens`/`total_tokens`.
 
 `extractReasoningContentFromDelta`: prefers `delta.reasoning_content`/`delta.reasoning`; falls back to `delta.extra.summary_thought.content` (array joined by `\n`) only when `phase === "thinking_summary"`.
+
+`extractImageUrlsFromDelta`: pulls image URLs from `delta.extra.tool_result[].image` and `delta.extra.image_list[].image` on `role: "function"` deltas. Used in both streaming and non-streaming paths.
 
 ### Models (models.js)
 - `MODELS` — static object, **20 models** with `contextSize`, `enableThinking`, `vision`, `tier` metadata
@@ -124,21 +129,34 @@ Qwen's SSE returns `data: {json}\n\n` lines. Each event has:
 - `listModels()` — fetches `GET /api/models` (public, no auth), maps to `{ id, name, object: "model", created, owned_by: "qwen" }`, caches 5 min (`CACHE_TTL`). Falls back to static list on failure.
 
 ### WebUI Proxying (webui.js)
-- `proxyToUpstream` — sets `source: desktop`, `authorization: Bearer {jwt}`, `cookie`, desktop UA, `referer`, `x-request-id`. For SSE paths (`/chat/completions`), sets `X-Accel-Buffering: no` and streams the response body through. Otherwise buffers and forwards with the upstream content-type.
+- `proxyToUpstream` — sets `source: desktop`, `authorization: Bearer {jwt}`, `cookie`, desktop UA, `referer`, `x-request-id`. For SSE paths (`/chat/completions`), sets `X-Accel-Buffering: no` and streams the response body through while scanning SSE for `function_call` events (logs `[webui] tool_call: <name>` once per tool). Also logs `[webui] prompt: <text>` via `extractWebPrompt` from the request body. Otherwise buffers and forwards with the upstream content-type.
 - `serveHtml` — fetches SPA HTML from upstream, runs `patchHtml`, sets `token={jwt}` cookie (1h expiry) when a JWT is present, no-cache headers.
 - HTML pages served: `/`, `/c/*`, `/auth`, `/authorize`.
 - ANON mode API routing: chat completions + `chats/new` + specific chat ID (PUT/DELETE) use **real JWT** (`getJwt(true)`); everything else proxied without auth (guest). If no real creds → 401.
 - Non-ANON: public APIs (`/api/v2/configs`, `/api/v2/tts/`, `/api/v2/users/status`, `/api/v2/models`, `/api/models`) proxy without JWT; everything else requires JWT or 401.
 
 ## Supported Tools
-Built-in only (no user-supplied tools). User-defined function tools in requests are ignored.
-- `web_search` — auto web search
-- `image-generation` — text-to-image
-- `code-interpreter` — Python execution
-- `amap` — maps/location
-- `fire-crawl` — web crawling
+Built-in only (no user-supplied tools). User-defined function tools in requests are ignored. Tool calls translated from Qwen `function_call` → OpenAI `tool_calls` format.
 
-Tool calls translated from Qwen `function_call` → OpenAI `tool_calls` format.
+| Tool | API name | Description |
+|------|----------|-------------|
+| Web search | `web_search` | Auto web search for factual/recent queries |
+| Image generation | `image_gen` | Text-to-image — result URLs emitted as `![image](url)` markdown in content |
+| Code interpreter | `code-interpreter` | Execute Python code in a sandbox |
+| Maps | `amap` | Maps and location search (Amap/高德) |
+| Fire crawl | `fire-crawl` | Web page crawling and extraction |
+
+Tool execution is **server-side at chat.qwen.ai** — our proxy does not execute tools. We only translate `function_call` events to OpenAI `tool_calls` and forward tool-result image URLs as content. Each tool name is logged once per request when first detected.
+
+## Logging
+Console output (also written to `.logs/server.log`):
+- Startup banner shows mode + login email (if authenticated)
+- `[req] POST /v1/chat/completions` — model, message count, stream flag
+- `[req] prompt: <text>` — last user message text (API path, `server.js:extractUserPrompt`)
+- `[webui] prompt: <text>` — last user message text (Web UI SSE path, `webui.js:extractWebPrompt`)
+- `[chat] tool_call: <name>` — tool name, logged once per tool when first detected (API path)
+- `[webui] tool_call: <name>` — tool name, logged once per tool from SSE stream (Web UI path)
+- `[chat]` / `[webui]` / `[models]` — other operational logs (login, model resolution, errors)
 
 ## Config
 `.config/config.json`. Keys **actually read by code**:
@@ -159,6 +177,7 @@ Browser/Client → HTTP (:3008) → Node.js Proxy
                   ├── /v1/models            → listModels() (src/models.js)
                   ├── /v1/chat/completions  → handleChatCompletion (src/chat.js)
                   ├── /health               → { status: "ok" }
+                  ├── /img?url=<cdn-url>    → image proxy (desktop UA + referer)
                   └── everything else       → handleWebUI (src/webui.js)
                        ├── /api/v2/auths/signin   → Proxy + save creds + fake user
                        ├── /api/v2/auths/signout  → Clear JWT + creds + set _loggedOut

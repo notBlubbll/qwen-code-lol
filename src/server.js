@@ -148,6 +148,37 @@ async function handleRequest(req, res, config) {
     return jsonResponse(res, 200, { status: 'ok' });
   }
 
+  // ── Image proxy: GET /img?url=<cdn-url> ────────────────────
+  // Qwen CDN images are blocked by orb (referer/auth). Proxy with desktop headers.
+  if (req.method === 'GET' && url.pathname === '/img') {
+    const target = url.searchParams.get('url');
+    if (!target || !/^https?:\/\//.test(target)) {
+      return jsonResponse(res, 400, { error: 'Missing or invalid url param' });
+    }
+    try {
+      const imgResp = await fetch(target, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 AliDesktop(QWENCHAT/1.0.3)',
+          'Referer': 'https://chat.qwen.ai/',
+          'Accept': 'image/*,*/*;q=0.8',
+        },
+      });
+      if (!imgResp.ok) {
+        return jsonResponse(res, imgResp.status, { error: `Upstream ${imgResp.status}` });
+      }
+      const buf = Buffer.from(await imgResp.arrayBuffer());
+      res.writeHead(200, {
+        'Content-Type': imgResp.headers.get('content-type') || 'image/png',
+        'Cache-Control': 'public, max-age=3600',
+        'Access-Control-Allow-Origin': '*',
+      });
+      return res.end(buf);
+    } catch (err) {
+      console.error(`[img] Proxy error: ${err.message}`);
+      return jsonResponse(res, 502, { error: { message: err.message } });
+    }
+  }
+
   // ── Everything else → Qwen Web UI reverse proxy ────────────
   return handleWebUI(req, res, url);
 }

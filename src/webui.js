@@ -407,13 +407,43 @@ const HEAD_INJECT_SCRIPT = `
     return origXhrSend.apply(this, arguments);
   };
 
+  // Rewrite CDN image URLs to go through our /img proxy (avoids orb blocking)
+  function proxyImg(src) {
+    if (!src || typeof src !== 'string') return src;
+    if (src.indexOf('cdn.qwenlm.ai') === -1 && src.indexOf('/output/') === -1) return src;
+    if (src.charAt(0) === '/') return '/img?url=' + encodeURIComponent(window.location.origin + src);
+    return '/img?url=' + encodeURIComponent(src);
+  }
+  function rewriteImg(el) {
+    if (!el || el.tagName !== 'IMG') return;
+    var s = el.getAttribute('src');
+    if (s && (s.indexOf('cdn.qwenlm.ai') !== -1 || (s.indexOf('/output/') !== -1 && s.indexOf('/img?') === -1))) {
+      el.setAttribute('src', proxyImg(s));
+    }
+  }
+
   function startObserver() {
     if (!document.body) return setTimeout(startObserver, 50);
-    var observer = new MutationObserver(function() {
+    var observer = new MutationObserver(function(mutations) {
       var overlay = document.querySelector('.account-pending-overlay');
       if (overlay) overlay.remove();
       var cookie = document.querySelector('[class*="cookie-confirm"]');
       if (cookie) cookie.remove();
+      for (var i = 0; i < mutations.length; i++) {
+        var m = mutations[i];
+        if (m.type === 'childList' && m.addedNodes) {
+          for (var j = 0; j < m.addedNodes.length; j++) {
+            var n = m.addedNodes[j];
+            if (n.nodeType === 1) {
+              if (n.tagName === 'IMG') rewriteImg(n);
+              if (n.querySelectorAll) {
+                var imgs = n.querySelectorAll('img');
+                for (var k = 0; k < imgs.length; k++) rewriteImg(imgs[k]);
+              }
+            }
+          }
+        }
+      }
     });
     observer.observe(document.body, { childList: true, subtree: true });
   }

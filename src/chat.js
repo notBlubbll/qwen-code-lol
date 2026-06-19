@@ -96,6 +96,13 @@ function buildHeaders(jwt, cookies) {
   };
 }
 
+// Rewrite a CDN image URL to go through our /img proxy (avoids orb blocking).
+function proxyImageUrl(url, config) {
+  if (!url || typeof url !== 'string') return url;
+  const port = config?.port || 3008;
+  return `http://127.0.0.1:${port}/img?url=${encodeURIComponent(url)}`;
+}
+
 // ─── Message parsing ──────────────────────────────────────────
 
 function parseIncomingMessages(messages) {
@@ -146,6 +153,27 @@ function extractReasoningContentFromDelta(delta) {
   const thoughtContent = delta?.extra?.summary_thought?.content;
   if (Array.isArray(thoughtContent)) return thoughtContent.filter(Boolean).join('\n');
   return '';
+}
+
+// Extract image URLs from tool-result deltas (role: "function").
+// These carry generated image links in extra.tool_result / extra.image_list.
+function extractImageUrlsFromDelta(delta) {
+  if (!delta || typeof delta !== 'object') return [];
+  const urls = [];
+  const extra = delta.extra;
+  if (extra && typeof extra === 'object') {
+    if (Array.isArray(extra.tool_result)) {
+      for (const r of extra.tool_result) {
+        if (r?.image) urls.push(r.image);
+      }
+    }
+    if (Array.isArray(extra.image_list)) {
+      for (const r of extra.image_list) {
+        if (r?.image) urls.push(r.image);
+      }
+    }
+  }
+  return urls;
 }
 
 function mapUsageToOpenAI(usage) {
@@ -385,12 +413,19 @@ async function* streamChat(resp, model, responseId, created) {
             continue;
           }
 
-          // Skip tool-result deltas (role: function) in streaming —
-          // they carry search results we don't forward as content.
+          // Tool-result deltas (role: function) carry search results and
+          // generated images. Extract image URLs to emit as content; skip
+          // the rest (we don't forward search result text as content).
           const upstreamDelta = parsed?.choices?.[0]?.delta;
           if (upstreamDelta?.role === 'function') {
-            // Mark that we've seen tool results so we can emit finish_reason
-            // on the subsequent status:finished event.
+            const imageUrls = extractImageUrlsFromDelta(upstreamDelta);
+            for (const imgUrl of imageUrls) {
+              const md = `![image](${proxyImageUrl(imgUrl, _config)})`;
+              yield {
+                id: responseId, object: 'chat.completion.chunk', created, model,
+                choices: [{ index: 0, delta: { role: 'assistant', content: md }, finish_reason: null }],
+              };
+            }
             continue;
           }
 
@@ -458,6 +493,15 @@ async function collectChat(resp, model, responseId, created) {
         const parsed = JSON.parse(data);
         if (parsed['response.created']) continue;
         if (parsed?.usage) usage = parsed.usage;
+
+        // Extract image URLs from tool-result deltas (role: function)
+        const upstreamDelta = parsed?.choices?.[0]?.delta;
+        if (upstreamDelta?.role === 'function') {
+          for (const imgUrl of extractImageUrlsFromDelta(upstreamDelta)) {
+            contentParts.push(`![image](${proxyImageUrl(imgUrl, _config)})`);
+          }
+          continue;
+        }
 
         const mapped = mapper.map(parsed);
         if (!mapped) continue;
