@@ -5,6 +5,8 @@
   "main": "src/server.js",
   "type": "module",
   "scripts": {
+    "preinstall": "node -e \"const fs=require('fs'),p=require('path').join(__dirname,'package-lock.json');if(fs.existsSync(p))try{fs.unlinkSync(p)}catch{}\"",
+    "prestart": "node -e \"const fs=require('fs'),p=require('path').join(__dirname,'nul');if(fs.existsSync(p))try{fs.unlinkSync(p)}catch{}\"",
     "start": "node src/server.js",
     "dev": "node --watch src/server.js"
   },

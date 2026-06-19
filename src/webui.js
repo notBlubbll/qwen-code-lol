@@ -100,12 +100,12 @@ function isLoggedIn() {
   return !_loggedOut && _jwt && Date.now() < _jwtExpiry;
 }
 
-async function getJwt() {
+async function getJwt(forceLogin = false) {
   if (isLoggedIn()) {
     return { jwt: _jwt, cookies: _cookies, user: _user };
   }
 
-  if (_loggedOut) return null;
+  if (_loggedOut && !forceLogin) return null;
 
   const { email, password, passwordHash } = _config.qwenLogin || {};
   if (!email || (!password && !passwordHash)) return null;
@@ -217,6 +217,7 @@ function handleAnonToggle(res, enable, redirect) {
   if (enable) {
     cfg.ANON = true;
     clearJwt();
+    _loggedOut = false;
     _anonJwt = generateFakeJwt();
   } else {
     delete cfg.ANON;
@@ -697,7 +698,7 @@ export async function handleWebUI(req, res, url) {
 
       if (needsRealJwt) {
         try {
-          const realAuth = await getJwt();
+          const realAuth = await getJwt(true);
           if (realAuth) {
             return proxyToUpstream(req, res, pathname, search, body, realAuth.jwt, realAuth.cookies);
           }

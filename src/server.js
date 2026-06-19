@@ -7,7 +7,7 @@
  */
 
 import { createServer } from 'http';
-import { readFileSync, existsSync } from 'fs';
+import { readFileSync, existsSync, mkdirSync, createWriteStream, unlinkSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { listModels } from './models.js';
@@ -15,6 +15,20 @@ import { handleChatCompletion } from './chat.js';
 import { handleWebUI } from './webui.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+
+// ─── Logging to .logs/server.log ──────────────────────────────
+const logsDir = resolve(__dirname, '../.logs');
+if (!existsSync(logsDir)) mkdirSync(logsDir, { recursive: true });
+const logStream = createWriteStream(resolve(logsDir, 'server.log'), { flags: 'a' });
+const origLog = console.log;
+const origErr = console.error;
+function stamp() { return new Date().toISOString().slice(0, 19); }
+console.log = (...args) => { origLog(...args); logStream.write(`[${stamp()}] ${args.join(' ')}\n`); };
+console.error = (...args) => { origErr(...args); logStream.write(`[${stamp()}] ERR ${args.join(' ')}\n`); };
+
+// ─── Prevent nul file creation (Git Bash compat) ──────────────
+const nulPath = resolve(__dirname, '../nul');
+if (existsSync(nulPath)) { try { unlinkSync(nulPath); } catch {} }
 
 // ─── Config ───────────────────────────────────────────────────
 
