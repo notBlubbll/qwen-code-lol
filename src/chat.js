@@ -100,7 +100,9 @@ function buildHeaders(jwt, cookies) {
 function proxyImageUrl(url, config) {
   if (!url || typeof url !== 'string') return url;
   const port = config?.port || 3008;
-  return `http://127.0.0.1:${port}/img?url=${encodeURIComponent(url)}`;
+  const pathPart = url.split('?')[0];
+  const filename = pathPart.substring(pathPart.lastIndexOf('/') + 1) || 'download';
+  return `http://127.0.0.1:${port}/img/${filename}?key=proxy&url=${encodeURIComponent(url)}`;
 }
 
 // ─── Message parsing ──────────────────────────────────────────

@@ -372,7 +372,9 @@ const HEAD_INJECT_SCRIPT = `
     }
     // Rewrite CDN image fetches to go through /img proxy (avoids orb blocking)
     if (url.indexOf('cdn.qwenlm.ai') !== -1 || url.indexOf('img.alicdn.com') !== -1 || url.indexOf('assets.alicdn.com') !== -1 || (url.indexOf('/output/') !== -1 && url.indexOf('/img?') === -1)) {
-      var newUrl = '/img?url=' + encodeURIComponent(url);
+      var proxyUrl = url;
+      if (proxyUrl.indexOf('//') === 0) proxyUrl = 'https:' + proxyUrl; // protocol-relative
+      var newUrl = '/img?url=' + encodeURIComponent(proxyUrl);
       input = newUrl;
       url = newUrl;
     }
@@ -421,7 +423,8 @@ const HEAD_INJECT_SCRIPT = `
         src.indexOf('/output/') === -1 &&
         src.indexOf('img.alicdn.com') === -1 &&
         src.indexOf('assets.alicdn.com') === -1) return src;
-    if (src.charAt(0) === '/') return '/img?url=' + encodeURIComponent(window.location.origin + src);
+    // Protocol-relative URL (//assets.alicdn.com/...) → prepend https:
+    if (src.indexOf('//') === 0) src = 'https:' + src;
     return '/img?url=' + encodeURIComponent(src);
   }
   // Rewrite a CSS url(...) value, proxying any CDN image URLs inside it
@@ -521,21 +524,6 @@ const HEAD_INJECT_SCRIPT = `
       }
     });
     observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['style', 'src'] });
-    // Poll for background-image changes (React sets el.style.backgroundImage which
-    // doesn't trigger attribute mutations in Chromium)
-    var pollCount = 0;
-    function poll() {
-      var els = document.querySelectorAll('[style*="cdn.qwenlm.ai"], [style*="/output/"], [style*="alicdn.com"]');
-      for (var i = 0; i < els.length; i++) {
-        rewriteBg(els[i]);
-      }
-      var imgs = document.querySelectorAll('img[src*="cdn.qwenlm.ai"], img[src*="alicdn.com"]');
-      for (var j = 0; j < imgs.length; j++) {
-        rewriteImg(imgs[j]);
-      }
-      if (pollCount++ < 200) requestAnimationFrame(poll);
-    }
-    requestAnimationFrame(poll);
   }
   startObserver();
 })();
@@ -680,6 +668,18 @@ async function proxyToUpstream(req, res, pathname, search, body, jwt, cookies) {
   const url = `${UPSTREAM}${pathname}${search}`;
   const isSse = pathname.includes('/chat/completions');
 
+  // Un-rewrite proxied media URLs in request bodies (SPA sends http://127.0.0.1:PORT/img/<filename>?key=proxy&url=...
+  // back to upstream APIs like share_url — restore the original CDN URL)
+  if (body && body.includes('/img/')) {
+    body = body.replace(/https?:\/\/[^"'\s]+\/img\/[^"'\s?]+\?key=proxy&url=([^"&\s]+)/g, (match, encoded) => {
+      try { return decodeURIComponent(encoded); } catch { return match; }
+    }).replace(/https?:\/\/[^"'\s]+\/img\?key=proxy&url=([^"&\s]+)/g, (match, encoded) => {
+      try { return decodeURIComponent(encoded); } catch { return match; }
+    }).replace(/https?:\/\/[^"'\s]+\/img\?url=([^"&\s]+)/g, (match, encoded) => {
+      try { return decodeURIComponent(encoded); } catch { return match; }
+    });
+  }
+
   if (isSse && body) {
     const prompt = extractWebPrompt(body);
     if (prompt) console.log(`[webui] prompt: ${prompt}`);
@@ -750,11 +750,27 @@ async function proxyToUpstream(req, res, pathname, search, body, jwt, cookies) {
     }
 
     let respBody = await resp.text();
-    // Rewrite CDN image URLs in JSON API responses so the SPA never sees them.
+    // Rewrite CDN image URLs in API responses and JS bundles so the SPA never sees them.
     // This prevents ERR_BLOCKED_BY_ORB on background-image / img src.
-    if (respBody && respBody.includes('cdn.qwenlm.ai')) {
-      respBody = respBody.replace(/https?:\/\/cdn\.qwenlm\.ai\/output\/[^"'\s,)}\]]+/g, (url) => {
-        return `http://127.0.0.1:${_config.port || 3008}/img?url=${encodeURIComponent(url)}`;
+    if (respBody && (respBody.includes('cdn.qwenlm.ai') || respBody.includes('//assets.alicdn.com') || respBody.includes('//img.alicdn.com'))) {
+      const port = _config.port || 3008;
+      // Rewrite cdn.qwenlm.ai output URLs (include commas for x-oss-process params)
+      // Use ?key= before url= so the SPA's El() check (e.includes("?key=")) passes
+      // — this skips the broken share_url API call and downloads directly.
+      // Put the original filename in the path so the SPA's Al() extracts it correctly.
+      respBody = respBody.replace(/https?:\/\/cdn\.qwenlm\.ai\/output\/[^"'\s)}\]]+/g, (url) => {
+        const encoded = encodeURIComponent(url);
+        // Extract original filename from the CDN URL path
+        const pathPart = url.split('?')[0];
+        const filename = pathPart.substring(pathPart.lastIndexOf('/') + 1) || 'download';
+        return `http://127.0.0.1:${port}/img/${filename}?key=proxy&url=${encoded}`;
+      });
+      // Rewrite protocol-relative alicdn URLs (//assets.alicdn.com/..., //img.alicdn.com/...)
+      respBody = respBody.replace(/\/\/(assets\.alicdn\.com|img\.alicdn\.com)\/[^"'\s)}\]]+/g, (url) => {
+        const encoded = encodeURIComponent('https:' + url);
+        const pathPart = url.split('?')[0];
+        const filename = pathPart.substring(pathPart.lastIndexOf('/') + 1) || 'download';
+        return `http://127.0.0.1:${port}/img/${filename}?key=proxy&url=${encoded}`;
       });
     }
     res.writeHead(resp.status, {

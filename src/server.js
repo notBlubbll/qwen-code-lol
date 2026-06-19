@@ -148,31 +148,72 @@ async function handleRequest(req, res, config) {
     return jsonResponse(res, 200, { status: 'ok' });
   }
 
-  // ── Image proxy: GET /img?url=<cdn-url> ────────────────────
-  // Qwen CDN images are blocked by orb (referer/auth). Proxy with desktop headers.
-  if (req.method === 'GET' && url.pathname === '/img') {
+  // ── Media proxy: GET /img/<filename>?key=proxy&url=<cdn-url> ────
+  // Qwen CDN media is blocked by orb (referer/auth). Proxy with desktop headers.
+  // Supports images, videos, and range requests for video seeking.
+  // The <filename> in the path is the original file's name (for download filenames).
+  if (req.method === 'GET' && url.pathname.startsWith('/img')) {
     const target = url.searchParams.get('url');
     if (!target || !/^https?:\/\//.test(target)) {
       return jsonResponse(res, 400, { error: 'Missing or invalid url param' });
     }
+    // Extract filename from path for Content-Disposition
+    const pathParts = url.pathname.split('/');
+    const filename = pathParts[pathParts.length - 1] || 'download';
+    // Forward extra query params (e.g. x-oss-process) to the upstream URL
+    let fullTarget = target;
+    const extraParams = [...url.searchParams.entries()].filter(([k]) => k !== 'url' && k !== 'key');
+    if (extraParams.length > 0) {
+      const sep = target.includes('?') ? '&' : '?';
+      fullTarget = target + sep + extraParams.map(([k, v]) => `${k}=${v}`).join('&');
+    }
     try {
-      const imgResp = await fetch(target, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 AliDesktop(QWENCHAT/1.0.3)',
-          'Referer': 'https://chat.qwen.ai/',
-          'Accept': 'image/*,*/*;q=0.8',
-        },
-      });
-      if (!imgResp.ok) {
-        return jsonResponse(res, imgResp.status, { error: `Upstream ${imgResp.status}` });
+      const proxyHeaders = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 AliDesktop(QWENCHAT/1.0.3)',
+        'Referer': 'https://chat.qwen.ai/',
+        'Accept': '*/*',
+      };
+      // Forward range header for video seeking
+      if (req.headers.range) proxyHeaders['Range'] = req.headers.range;
+
+      const mediaResp = await fetch(fullTarget, { headers: proxyHeaders });
+      if (!mediaResp.ok && mediaResp.status !== 206) {
+        return jsonResponse(res, mediaResp.status, { error: `Upstream ${mediaResp.status}` });
       }
-      const buf = Buffer.from(await imgResp.arrayBuffer());
-      res.writeHead(200, {
-        'Content-Type': imgResp.headers.get('content-type') || 'image/png',
+
+      const contentType = mediaResp.headers.get('content-type') || 'application/octet-stream';
+      const contentLength = mediaResp.headers.get('content-length');
+      const contentRange = mediaResp.headers.get('content-range');
+
+      const respHeaders = {
+        'Content-Type': contentType,
         'Cache-Control': 'public, max-age=3600',
         'Access-Control-Allow-Origin': '*',
-      });
-      return res.end(buf);
+        'Content-Disposition': `attachment; filename="${filename}"`,
+      };
+      if (contentLength) respHeaders['Content-Length'] = contentLength;
+      if (contentRange) respHeaders['Content-Range'] = contentRange;
+      if (contentRange) respHeaders['Accept-Ranges'] = 'bytes';
+
+      const status = mediaResp.status === 206 ? 206 : 200;
+      res.writeHead(status, respHeaders);
+
+      // Stream the response body directly
+      const reader = mediaResp.body.getReader();
+      const pump = async () => {
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            res.write(value);
+          }
+        } catch (e) {
+          console.error('[img] Stream error:', e.message);
+        }
+        res.end();
+      };
+      pump();
+      return;
     } catch (err) {
       console.error(`[img] Proxy error: ${err.message}`);
       return jsonResponse(res, 502, { error: { message: err.message } });
