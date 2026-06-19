@@ -130,6 +130,13 @@ function parseIncomingMessages(messages) {
 
 // ─── SSE parsing ──────────────────────────────────────────────
 
+// NOTE on upstream cumulative fields:
+//   delta.content (phase=answer)            → TRUE DELTA (incremental pieces)
+//   delta.extra.summary_thought.content     → CUMULATIVE (full array of thoughts so far)
+//   delta.function_call.arguments           → CUMULATIVE (full args string built so far)
+//   delta.status: "finished"                → upstream's completion signal (finish_reason is never set)
+// We must diff cumulative fields before emitting them as OpenAI deltas.
+
 function extractReasoningContentFromDelta(delta) {
   if (!delta || typeof delta !== 'object') return '';
   const direct = delta.reasoning_content || delta.reasoning || '';
@@ -141,41 +148,105 @@ function extractReasoningContentFromDelta(delta) {
   return '';
 }
 
-function mapUpstreamDeltaToOpenAI(delta) {
-  if (!delta || typeof delta !== 'object') return null;
-  const mapped = {};
-  if (delta.role === 'assistant') mapped.role = delta.role;
-  if (typeof delta.content === 'string') mapped.content = delta.content;
-  const reasoning = extractReasoningContentFromDelta(delta);
-  if (reasoning) mapped.reasoning_content = reasoning;
-
-  // Translate Qwen's function_call → OpenAI tool_calls
-  // Qwen sends: { function_call: { name, arguments }, function_id }
-  // OpenAI expects: { tool_calls: [{ id, type: "function", function: { name, arguments } }] }
-  if (delta.function_call) {
-    const fnName = delta.function_call.name || '';
-    const fnArgs = typeof delta.function_call.arguments === 'string'
-      ? delta.function_call.arguments
-      : JSON.stringify(delta.function_call.arguments || {});
-    if (fnName) {
-      mapped.tool_calls = [{
-        index: 0,
-        id: delta.function_id || `call_${randomUUID().replace(/-/g, '').slice(0, 24)}`,
-        type: 'function',
-        function: { name: fnName, arguments: fnArgs },
-      }];
-    }
-  }
-
-  return Object.keys(mapped).length > 0 ? mapped : null;
-}
-
 function mapUsageToOpenAI(usage) {
   return {
     prompt_tokens: Number(usage?.input_tokens || 0),
     completion_tokens: Number(usage?.output_tokens || 0),
     total_tokens: Number(usage?.total_tokens || 0),
   };
+}
+
+// Stateful mapper that diffs cumulative fields (reasoning, tool-call args)
+// so we only emit the new portion as OpenAI deltas.
+class DeltaMapper {
+  constructor() {
+    this._lastReasoning = '';
+    this._toolArgs = new Map(); // id → last args string
+    this._toolNames = new Map(); // id → name
+    this._hadToolCalls = false;
+    this._loggedTools = null; // Set<string> — logs each tool name once
+  }
+
+  // Returns { delta, finishReason } or null.
+  // delta is an OpenAI-format delta object (may be {}).
+  // finishReason is 'stop' | 'tool_calls' | null.
+  map(parsed) {
+    const choice = parsed?.choices?.[0];
+    const delta = choice?.delta;
+    if (!delta || typeof delta !== 'object') return null;
+
+    const mapped = {};
+    let finishReason = choice?.finish_reason || null;
+
+    if (delta.role === 'assistant') mapped.role = delta.role;
+
+    // Content (true delta — pass through)
+    if (typeof delta.content === 'string' && delta.content) mapped.content = delta.content;
+
+    // Reasoning (cumulative — diff against last sent)
+    const reasoningFull = extractReasoningContentFromDelta(delta);
+    if (reasoningFull && reasoningFull.length > this._lastReasoning.length) {
+      const diff = reasoningFull.slice(this._lastReasoning.length);
+      this._lastReasoning = reasoningFull;
+      if (diff) mapped.reasoning_content = diff;
+    }
+
+    // Tool calls (function_call.arguments is cumulative — diff per tool id)
+    if (delta.function_call) {
+      const fnName = delta.function_call.name || '';
+      const fnArgs = typeof delta.function_call.arguments === 'string'
+        ? delta.function_call.arguments
+        : JSON.stringify(delta.function_call.arguments || {});
+      const toolId = delta.function_id || `call_${randomUUID().replace(/-/g, '').slice(0, 24)}`;
+
+      if (fnName) {
+        this._toolNames.set(toolId, fnName);
+        if (!this._loggedTools) this._loggedTools = new Set();
+        if (!this._loggedTools.has(fnName)) {
+          this._loggedTools.add(fnName);
+          console.log(`[chat] tool_call: ${fnName}`);
+        }
+      }
+
+      const lastArgs = this._toolArgs.get(toolId) || '';
+      const argDiff = fnArgs.length > lastArgs.length ? fnArgs.slice(lastArgs.length) : '';
+      this._toolArgs.set(toolId, fnArgs);
+      this._hadToolCalls = true;
+
+      if (fnName || argDiff) {
+        mapped.tool_calls = [{
+          index: 0,
+          id: toolId,
+          type: 'function',
+          function: {
+            ...(fnName ? { name: fnName } : {}),
+            ...(argDiff ? { arguments: argDiff } : (fnName ? { arguments: '' } : {})),
+          },
+        }];
+      }
+    }
+
+    // Upstream never sets finish_reason. Infer from status: "finished".
+    if (!finishReason && delta.status === 'finished') {
+      // If we emitted tool calls, the completion reason is "tool_calls"
+      // only when the tool-result (role: function) arrives. For the
+      // answer phase, it's "stop".
+      if (delta.phase === 'answer') {
+        finishReason = 'stop';
+      } else if (delta.role === 'function') {
+        finishReason = 'tool_calls';
+      }
+    }
+
+    return { delta: mapped, finishReason };
+  }
+
+  get hadToolCalls() { return this._hadToolCalls; }
+  // Final args per tool id (last cumulative value seen)
+  getToolCallArgs(toolId) { return this._toolArgs.get(toolId) || ''; }
+  getToolCallName(toolId) { return this._toolNames.get(toolId) || ''; }
+  getAllToolIds() { return [...this._toolArgs.keys()]; }
+  get finalReasoning() { return this._lastReasoning; }
 }
 
 // ─── Create chat session ──────────────────────────────────────
@@ -282,6 +353,8 @@ async function* streamChat(resp, model, responseId, created) {
   const reader = resp.body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
+  const mapper = new DeltaMapper();
+  let emittedFinish = false;
 
   try {
     while (true) {
@@ -308,36 +381,48 @@ async function* streamChat(resp, model, responseId, created) {
               id: responseId, object: 'chat.completion.chunk', created, model,
               choices: [{ index: 0, delta: { role: 'assistant', content: errMsg }, finish_reason: 'stop' }],
             };
+            emittedFinish = true;
             continue;
           }
 
-          const delta = mapUpstreamDeltaToOpenAI(parsed?.choices?.[0]?.delta);
-          let finishReason = parsed?.choices?.[0]?.finish_reason || null;
-
-          // When a function call completes, map finish to "tool_calls"
-          if (delta?.tool_calls && !finishReason) {
-            // Tool call in progress — no finish yet
-          }
-          // Qwen sends status: "finished" with phase: "web_search" etc.
-          // When the function result comes back (role: "function"), don't emit as tool_calls
-          if (delta?.role === 'function') {
-            // This is a tool result — pass as content for compatibility
+          // Skip tool-result deltas (role: function) in streaming —
+          // they carry search results we don't forward as content.
+          const upstreamDelta = parsed?.choices?.[0]?.delta;
+          if (upstreamDelta?.role === 'function') {
+            // Mark that we've seen tool results so we can emit finish_reason
+            // on the subsequent status:finished event.
             continue;
           }
 
-          if (delta || finishReason) {
-            // If we had tool calls and now finishing, use "tool_calls" finish reason
-            if (finishReason === 'stop' && delta?.tool_calls) {
-              finishReason = 'tool_calls';
+          const mapped = mapper.map(parsed);
+          if (!mapped) continue;
+
+          const { delta, finishReason } = mapped;
+          const usage = parsed?.usage;
+
+          if (Object.keys(delta).length > 0 || finishReason) {
+            if (finishReason === 'stop' && mapper.hadToolCalls) {
+              // If we had tool calls but the stream ends with an answer,
+              // the real finish reason is "stop" (answer completed).
             }
             yield {
               id: responseId, object: 'chat.completion.chunk', created, model,
               choices: [{ index: 0, delta: delta || {}, finish_reason: finishReason }],
-              ...(parsed?.usage ? { usage: mapUsageToOpenAI(parsed.usage) } : {}),
+              ...(usage ? { usage: mapUsageToOpenAI(usage) } : {}),
             };
+            if (finishReason === 'stop') emittedFinish = true;
           }
         } catch {}
       }
+    }
+
+    // If upstream ended without a finish_reason, emit one
+    if (!emittedFinish) {
+      const fr = mapper.hadToolCalls ? 'tool_calls' : 'stop';
+      yield {
+        id: responseId, object: 'chat.completion.chunk', created, model,
+        choices: [{ index: 0, delta: {}, finish_reason: fr }],
+      };
     }
   } finally {
     reader.releaseLock?.();
@@ -351,10 +436,9 @@ async function collectChat(resp, model, responseId, created) {
   const decoder = new TextDecoder();
   let buffer = '';
   const contentParts = [];
-  const reasoningParts = [];
-  const toolCalls = []; // { id, function: { name, arguments } }
+  const mapper = new DeltaMapper();
   let usage = null;
-  let hadToolCalls = false;
+  let finalFinishReason = 'stop';
 
   while (true) {
     const { done, value } = await reader.read();
@@ -375,34 +459,32 @@ async function collectChat(resp, model, responseId, created) {
         if (parsed['response.created']) continue;
         if (parsed?.usage) usage = parsed.usage;
 
-        const delta = mapUpstreamDeltaToOpenAI(parsed?.choices?.[0]?.delta);
-        if (delta?.content) contentParts.push(delta.content);
-        if (delta?.reasoning_content) reasoningParts.push(delta.reasoning_content);
-        if (delta?.tool_calls) {
-          hadToolCalls = true;
-          for (const tc of delta.tool_calls) {
-            // Merge arguments across chunks for the same tool call
-            const existing = toolCalls.find(t => t.id === tc.id);
-            if (existing) {
-              existing.function.arguments += tc.function.arguments;
-            } else {
-              toolCalls.push({ ...tc });
-            }
-          }
-        }
+        const mapped = mapper.map(parsed);
+        if (!mapped) continue;
+        if (mapped.delta?.content) contentParts.push(mapped.delta.content);
+        if (mapped.finishReason === 'stop') finalFinishReason = 'stop';
+        if (mapped.finishReason === 'tool_calls') finalFinishReason = 'tool_calls';
       } catch {}
     }
   }
 
   const content = contentParts.join('');
-  const reasoning = reasoningParts.join('');
+  const reasoning = mapper.finalReasoning;
 
   const message = { role: 'assistant', content };
   if (reasoning) message.reasoning_content = reasoning;
-  if (hadToolCalls) {
-    message.tool_calls = toolCalls.map(tc => ({
-      id: tc.id, type: 'function', function: tc.function,
+
+  // Build tool_calls from the mapper's final cumulative state
+  if (mapper.hadToolCalls && mapper.getAllToolIds().length > 0) {
+    const toolCalls = mapper.getAllToolIds().map(id => ({
+      id, type: 'function',
+      function: {
+        name: mapper.getToolCallName(id),
+        arguments: mapper.getToolCallArgs(id),
+      },
     }));
+    message.tool_calls = toolCalls;
+    finalFinishReason = 'tool_calls';
   }
 
   return {
@@ -410,7 +492,7 @@ async function collectChat(resp, model, responseId, created) {
     choices: [{
       index: 0,
       message,
-      finish_reason: hadToolCalls ? 'tool_calls' : 'stop',
+      finish_reason: finalFinishReason,
     }],
     usage: mapUsageToOpenAI(usage),
   };

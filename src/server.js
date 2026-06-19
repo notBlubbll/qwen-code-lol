@@ -70,6 +70,24 @@ function sseWrite(res, data) {
   res.write(`data: ${JSON.stringify(data)}\n\n`);
 }
 
+// Extract the text of the last user message from an OpenAI-style messages array.
+function extractUserPrompt(messages) {
+  if (!Array.isArray(messages) || messages.length === 0) return '';
+  let msg = null;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i]?.role === 'user') { msg = messages[i]; break; }
+  }
+  if (!msg) msg = messages[messages.length - 1];
+  const c = msg?.content;
+  if (typeof c === 'string') return c;
+  if (Array.isArray(c)) {
+    return c.filter(p => typeof p === 'string' || p?.type === 'text')
+      .map(p => typeof p === 'string' ? p : p.text || '')
+      .join('\n');
+  }
+  return '';
+}
+
 // ─── Request router ───────────────────────────────────────────
 
 async function handleRequest(req, res, config) {
@@ -97,6 +115,8 @@ async function handleRequest(req, res, config) {
       if (!body.model) body.model = config.defaultModel;
 
       console.log(`[req] POST /v1/chat/completions model=${body.model} msgs=${body.messages?.length || 0} stream=${!!body.stream}`);
+      const prompt = extractUserPrompt(body.messages);
+      if (prompt) console.log(`[req] prompt: ${prompt}`);
 
       const result = await handleChatCompletion(body);
 
@@ -139,7 +159,7 @@ async function main() {
   console.log('=== Qwen Slurp Proxy Server ===');
 
   const hasLogin = !!config.qwenLogin?.email;
-  console.log(`Mode: ${hasLogin ? 'authenticated (desktop API + JWT)' : 'guest (UI only — login required)'}`);
+  console.log(`Mode: ${hasLogin ? `authenticated (desktop API + JWT) — ${config.qwenLogin.email}` : 'guest (UI only — login required)'}`);
 
   const server = createServer((req, res) => handleRequest(req, res, config));
   server.listen(config.port, '0.0.0.0', () => {

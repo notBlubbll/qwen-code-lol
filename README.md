@@ -149,24 +149,46 @@ The injected toggle button sets `window.__qwenSseEnabled`. When disabled, the fe
 
 ## Supported Tools
 
-The Qwen Web API uses **built-in tools only** — user-supplied tool definitions in requests are ignored. Tool calls are translated to OpenAI's `tool_calls` format.
+The Qwen Web API uses **built-in tools only** — user-supplied tool/function definitions in requests are ignored. Tool calls are automatically invoked by Qwen and translated to OpenAI's `tool_calls` format in the response.
 
 | Tool | Description |
 |------|-------------|
-| `web_search` | Web search (auto-invoked for factual queries) |
-| `image-generation` | Generate images from text |
-| `code-interpreter` | Execute Python code |
+| `web_search` | Web search (auto-invoked for factual/recent queries) |
+| `image-generation` | Generate images from text prompts |
+| `code-interpreter` | Execute Python code in a sandbox |
 | `amap` | Maps and location search (Amap/高德) |
 | `fire-crawl` | Web page crawling and extraction |
 
 ## Models
 
-Fetched live from `https://chat.qwen.ai/api/models` (public, 5-min cache). Static fallback with **20 models** including:
-- **Flagship**: qwen3.7-plus, qwen3.7-max, qwen3.6-plus, qwen3.6-max-preview, qwen3.5-plus, qwen3.5-flash, qwen3.5-omni-plus, qwen3.5-omni-flash, qwen3.5-max-2026-03-08, qwen3.6-plus-preview
-- **Open-source**: qwen3.6-27b, qwen3.5-27b, qwen3.5-35b-a3b, qwen3.5-397b-a17b, qwen3.5-122b-a10b
-- **Specialized**: qwen3-coder-plus, qwen3-vl-plus, qwen3-omni-flash-2025-12-01, qwen3-max-2026-01-23, qwen-plus-2025-07-28
+Fetched live from `https://chat.qwen.ai/api/models` (public endpoint, no auth, 5-min cache). Falls back to a static catalog of **20 models** on fetch failure. Models are resolved case-insensitively.
 
-Each model in the static catalog has `contextSize`, `enableThinking`, `vision`, and `tier` metadata.
+| Model | Context | Thinking | Vision |
+|-------|---------|----------|--------|
+| `qwen3.7-plus` | 1,000,000 | ✔ | ✔ |
+| `qwen3.7-max` | 1,000,000 | ✔ | — |
+| `qwen3.6-plus` | 1,000,000 | ✔ | ✔ |
+| `qwen3.6-plus-preview` | 1,000,000 | ✔ | ✔ |
+| `qwen3.6-max-preview` | 1,000,000 | ✔ | — |
+| `qwen3.6-27b` | 131,072 | — | — |
+| `qwen3.5-plus` | 1,000,000 | ✔ | ✔ |
+| `qwen3.5-flash` | 1,000,000 | ✔ | — |
+| `qwen3.5-max-2026-03-08` | 1,000,000 | ✔ | — |
+| `qwen3.5-omni-plus` | 1,000,000 | ✔ | ✔ |
+| `qwen3.5-omni-flash` | 1,000,000 | ✔ | ✔ |
+| `qwen3.5-27b` | 131,072 | — | — |
+| `qwen3.5-35b-a3b` | 131,072 | — | — |
+| `qwen3.5-397b-a17b` | 131,072 | — | — |
+| `qwen3.5-122b-a10b` | 131,072 | — | — |
+| `qwen3-max-2026-01-23` | 262,144 | ✔ | — |
+| `qwen3-coder-plus` | 1,000,000 | — | — |
+| `qwen3-vl-plus` | 131,072 | — | ✔ |
+| `qwen3-omni-flash-2025-12-01` | 131,072 | ✔ | ✔ |
+| `qwen-plus-2025-07-28` | 131,072 | — | — |
+
+All models are `tier: free`. Default model is `qwen3-coder-plus` (configurable via `defaultModel`).
+
+> **Note**: `feature_config.thinking_enabled` is hardcoded `true` in the chat request builder, so thinking output is always sent for models that support it (shown in `reasoning_content`). Models without thinking capability ignore this flag.
 
 ## Configuration
 

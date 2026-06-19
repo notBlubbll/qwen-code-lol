@@ -170,7 +170,7 @@ Browser/Client → HTTP (:3008) → Node.js Proxy
 ```
 
 ## Known Issues & Gotchas
-- **`/demo` route is not implemented**: `demo.html` exists at the repo root and is referenced by `start.cmd`, but no route in `server.js` or `webui.js` serves it. To make it work, add a `GET /demo` handler that reads and returns `demo.html`.
+- **Unused `playwright` dependency**: `package.json` lists `playwright` but no source file imports it. Safe to remove from dependencies (runtime is zero-dep; built-in `fetch` only).
 - **Unused config keys**: `enableThinking` and `enableCacheControl` in `.config/config.json` are never read. `thinking_enabled` is hardcoded `true` in `buildChatRequest`.
 - **Message flattening**: `chat.js` does not send multi-turn structured messages upstream. It concatenates all prior turns into one `[Role]: ...` text block and sends a single user message. This loses native turn structure but works for context.
 - **Hard fallback model mismatch**: `chat.js` falls back to `qwen3.7-plus` if both requested and `defaultModel` fail to resolve, even though `defaultModel` is `qwen3-coder-plus`.

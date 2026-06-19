@@ -29,7 +29,6 @@ echo.
 echo Starting server on http://127.0.0.1:3008 ...
 echo.
 echo   Open http://127.0.0.1:3008/         for Qwen Web UI
-echo   Open http://127.0.0.1:3008/demo     for simple chat demo
 echo   Use http://127.0.0.1:3008/v1/       for OpenAI API
 echo.
 start "" "http://127.0.0.1:3008/"

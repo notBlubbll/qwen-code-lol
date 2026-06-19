@@ -30,6 +30,15 @@ function saveConfig(cfg) {
   const cfgPath = join(__dirname, '../.config/config.json');
   writeFileSync(cfgPath, JSON.stringify(cfg, null, 2));
 }
+// Read fresh from disk, apply a mutation, save, and sync _config.
+// This avoids overwriting external config edits with stale in-memory state.
+function mutateConfig(mutator) {
+  const disk = loadConfig();
+  mutator(disk);
+  saveConfig(disk);
+  applyConfig(disk);
+  return disk;
+}
 const _config = loadConfig();
 
 // ─── Fake JWT (valid base64url structure, SPA can decode without crashing) ──
@@ -151,10 +160,10 @@ async function handleSignin(req, res, body) {
   try {
     const { email, password } = JSON.parse(body);
     if (email && password) {
-      const newCfg = { ..._config, qwenLogin: { email, passwordHash: password } };
-      delete newCfg.ANON;
-      saveConfig(newCfg);
-      applyConfig(newCfg);
+      mutateConfig(cfg => {
+        cfg.qwenLogin = { email, passwordHash: password };
+        delete cfg.ANON;
+      });
       console.log(`[webui] Saved credentials for ${email}`);
     }
 
@@ -200,11 +209,10 @@ function handleSignout(res) {
   clearJwt();
   _loggedOut = true;
   try {
-    const cfg = { ..._config };
-    delete cfg.qwenLogin;
-    delete cfg.ANON;
-    saveConfig(cfg);
-    applyConfig(cfg);
+    mutateConfig(cfg => {
+      delete cfg.qwenLogin;
+      delete cfg.ANON;
+    });
   } catch {}
   console.log('[webui] User signed out');
   res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
@@ -213,19 +221,18 @@ function handleSignout(res) {
 
 // Handle anon mode toggle
 function handleAnonToggle(res, enable, redirect) {
-  const cfg = { ..._config };
   if (enable) {
-    cfg.ANON = true;
     clearJwt();
     _loggedOut = false;
     _anonJwt = generateFakeJwt();
   } else {
-    delete cfg.ANON;
     clearJwt();
     _loggedOut = true;
   }
-  saveConfig(cfg);
-  applyConfig(cfg);
+  mutateConfig(cfg => {
+    if (enable) cfg.ANON = true;
+    else delete cfg.ANON;
+  });
   console.log(`[webui] ANON mode ${enable ? 'enabled' : 'disabled'}`);
 
   if (redirect && !enable) {
@@ -524,11 +531,39 @@ function patchHtml(html, jwt) {
   return patched;
 }
 
+// Extract the user prompt text from a Qwen-native chat completion request body.
+function extractWebPrompt(bodyStr) {
+  if (!bodyStr) return '';
+  try {
+    const body = JSON.parse(bodyStr);
+    const msgs = body.messages;
+    if (!Array.isArray(msgs)) return '';
+    let msg = null;
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      if (msgs[i]?.role === 'user') { msg = msgs[i]; break; }
+    }
+    if (!msg) msg = msgs[msgs.length - 1];
+    const c = msg?.content;
+    if (typeof c === 'string') return c;
+    if (Array.isArray(c)) {
+      return c.filter(p => typeof p === 'string' || p?.type === 'text')
+        .map(p => typeof p === 'string' ? p : p.text || '')
+        .join('\n');
+    }
+  } catch {}
+  return '';
+}
+
 // ─── Proxy a request to upstream ────────────────────────────
 
 async function proxyToUpstream(req, res, pathname, search, body, jwt, cookies) {
   const url = `${UPSTREAM}${pathname}${search}`;
   const isSse = pathname.includes('/chat/completions');
+
+  if (isSse && body) {
+    const prompt = extractWebPrompt(body);
+    if (prompt) console.log(`[webui] prompt: ${prompt}`);
+  }
 
   const headers = {
     'accept': req.headers.accept || '*/*',
@@ -558,11 +593,32 @@ async function proxyToUpstream(req, res, pathname, search, body, jwt, cookies) {
       });
       const reader = resp.body.getReader();
       const pump = async () => {
+        let sseBuf = '';
+        let loggedTools = new Set();
         try {
           while (true) {
             const { done, value } = await reader.read();
             if (done) break;
             res.write(value);
+            // Scan SSE for tool calls (function_call) — log each tool name once
+            sseBuf += new TextDecoder().decode(value, { stream: true });
+            const lines = sseBuf.split('\n');
+            sseBuf = lines.pop() || '';
+            for (const line of lines) {
+              const t = line.trimStart();
+              if (!t.startsWith('data:')) continue;
+              const d = t.slice(5).trim();
+              if (!d || d === '[DONE]') continue;
+              try {
+                const p = JSON.parse(d);
+                const fc = p?.choices?.[0]?.delta?.function_call;
+                const name = fc?.name;
+                if (name && !loggedTools.has(name)) {
+                  loggedTools.add(name);
+                  console.log(`[webui] tool_call: ${name}`);
+                }
+              } catch {}
+            }
           }
         } catch (e) {
           console.error('[webui] SSE stream error:', e.message);
